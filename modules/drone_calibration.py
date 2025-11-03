@@ -207,61 +207,97 @@ class CalibrationModel(QObject):
     
     @pyqtSlot()
     def _update_telemetry_data(self):
-        """Update current drone telemetry data including attitude, GPS, and altitude"""
-        if not self.isDroneConnected or not self._drone_model.drone_connection:
-            return
+     """Update current drone telemetry data including attitude, GPS, altitude, and calibration progress"""
+     if not self.isDroneConnected or not self._drone_model.drone_connection:
+        return
+        
+     try:
+        # Listen for calibration progress messages FIRST (if calibrating)
+        if self._level_calibration_active or self._accel_calibration_active:
+            self._listen_for_calibration_progress()
+        
+        # ALWAYS read and update attitude data - use blocking with short timeout
+        # This ensures we get the latest attitude regardless of calibration state
+        attitude_msg = self._drone_model.drone_connection.recv_match(
+            type='ATTITUDE', blocking=True, timeout=0.05
+        )
+        
+        if attitude_msg:
+            # Convert from radians to degrees
+            self._current_roll = math.degrees(attitude_msg.roll)
+            self._current_pitch = math.degrees(attitude_msg.pitch)
+            self._current_yaw = math.degrees(attitude_msg.yaw)
             
-        try:
-            # Get attitude data
-            attitude_msg = self._drone_model.drone_connection.recv_match(
-                type='ATTITUDE', blocking=False, timeout=0.1
-            )
+            # ALWAYS emit signal so UI updates
+            self.positionCheckChanged.emit()
             
-            if attitude_msg:
-                # Convert from radians to degrees
-                self._current_roll = math.degrees(attitude_msg.roll)
-                self._current_pitch = math.degrees(attitude_msg.pitch)
-                self._current_yaw = math.degrees(attitude_msg.yaw)
-                
-                # Update position check if active
-                if self._position_check_active:
-                    self._check_current_position()
-                
-                self.positionCheckChanged.emit()
+            # Update position check if active
+            if self._position_check_active:
+                self._check_current_position()
+        
+        # Get GPS data (non-blocking to avoid delays)
+        gps_msg = self._drone_model.drone_connection.recv_match(
+            type='GPS_RAW_INT', blocking=False, timeout=0
+        )
+        
+        if gps_msg:
+            self._gps_latitude = gps_msg.lat / 1e7  # Convert from 1e7 degrees
+            self._gps_longitude = gps_msg.lon / 1e7
+            self._gps_fix_type = gps_msg.fix_type
+            self._satellites_visible = gps_msg.satellites_visible
+            self._hdop = gps_msg.eph / 100.0 if gps_msg.eph != 65535 else 99.99
+            self._vdop = gps_msg.epv / 100.0 if gps_msg.epv != 65535 else 99.99
+            self.gpsDataChanged.emit()
+        
+        # Get altitude data (non-blocking)
+        global_pos_msg = self._drone_model.drone_connection.recv_match(
+            type='GLOBAL_POSITION_INT', blocking=False, timeout=0
+        )
+        
+        if global_pos_msg:
+            self._current_altitude = global_pos_msg.relative_alt / 1000.0  # Convert from mm to m
             
-            # Get GPS data
-            gps_msg = self._drone_model.drone_connection.recv_match(
-                type='GPS_RAW_INT', blocking=False, timeout=0.1
-            )
+            # Set correct altitude based on GPS and current position
+            if self._gps_fix_type >= 3:  # 3D fix
+                # Use current altitude as reference for "correct" altitude
+                if self._correct_altitude == 0.0:
+                    self._correct_altitude = self._current_altitude
             
-            if gps_msg:
-                self._gps_latitude = gps_msg.lat / 1e7  # Convert from 1e7 degrees
-                self._gps_longitude = gps_msg.lon / 1e7
-                self._gps_fix_type = gps_msg.fix_type
-                self._satellites_visible = gps_msg.satellites_visible
-                self._hdop = gps_msg.eph / 100.0 if gps_msg.eph != 65535 else 99.99
-                self._vdop = gps_msg.epv / 100.0 if gps_msg.epv != 65535 else 99.99
-                self.gpsDataChanged.emit()
+            self.altitudeDataChanged.emit()
             
-            # Get altitude data
-            global_pos_msg = self._drone_model.drone_connection.recv_match(
-                type='GLOBAL_POSITION_INT', blocking=False, timeout=0.1
-            )
-            
-            if global_pos_msg:
-                self._current_altitude = global_pos_msg.relative_alt / 1000.0  # Convert from mm to m
-                
-                # Set correct altitude based on GPS and current position
-                if self._gps_fix_type >= 3:  # 3D fix
-                    # Use current altitude as reference for "correct" altitude
-                    if self._correct_altitude == 0.0:
-                        self._correct_altitude = self._current_altitude
-                
-                self.altitudeDataChanged.emit()
-                
-        except Exception as e:
+     except Exception as e:
+        # Only log errors that aren't related to empty buffers
+        error_str = str(e)
+        if "readiness to read but returned no data" not in error_str:
             print(f"[CalibrationModel] Error reading telemetry: {e}")
+
+    @pyqtSlot()
+    def debugCalibrationStatus(self):
+     """Debug method to check calibration readiness"""
+     print("\n" + "="*60)
+     print("CALIBRATION STATUS DEBUG")
+     print("="*60)
+     print(f"Drone Connected: {self.isDroneConnected}")
+     print(f"Drone Model: {self._drone_model is not None}")
     
+     if self._drone_model:
+        print(f"Drone Connection Object: {self._drone_model.drone_connection is not None}")
+        if self._drone_model.drone_connection:
+            print(f"Target System: {self._drone_model.drone_connection.target_system}")
+            print(f"Target Component: {self._drone_model.drone_connection.target_component}")
+    
+     print(f"\nLevel Calibration Active: {self._level_calibration_active}")
+     print(f"Level Calibration Complete: {self._level_calibration_complete}")
+     print(f"Accel Calibration Active: {self._accel_calibration_active}")
+     print(f"Accel Calibration Complete: {self._accel_calibration_complete}")
+    
+     print(f"\nPosition Check Active: {self._position_check_active}")
+     print(f"Is Position Correct: {self._is_position_correct}")
+     print(f"Current Roll: {self._current_roll:.2f}°")
+     print(f"Current Pitch: {self._current_pitch:.2f}°")
+     print(f"Current Yaw: {self._current_yaw:.2f}°")
+     print("="*60 + "\n")
+
     @pyqtSlot()
     def setCorrectAltitude(self):
         """Set current altitude as the correct/reference altitude"""
@@ -299,63 +335,85 @@ class CalibrationModel(QObject):
                 self._position_stability_timer.stop()
     
     def _is_in_required_position(self, position_name):
-        """Check if drone is in the specified position with GPS-corrected nose directions"""
-        tolerance = self._position_tolerance
+     """Check if drone is in the specified position with GPS-corrected nose directions"""
+     tolerance = self._position_tolerance
+    
+    # Get GPS heading correction if available
+     has_gps_lock = self._gps_fix_type >= 3
+     gps_heading = self._current_yaw if has_gps_lock else 0.0
+    
+     if position_name == "Level":
+        # Level: Roll and Pitch should be close to 0
+        roll_ok = abs(self._current_roll) <= tolerance
+        pitch_ok = abs(self._current_pitch) <= tolerance
         
-        # Get GPS heading correction if available
-        gps_heading_offset = 0.0
-        if self._gps_fix_type >= 3:  # 3D fix available
-            # Use yaw as GPS-corrected heading
-            gps_heading_offset = self._current_yaw
+        if roll_ok and pitch_ok:
+            return True, f"✅ Drone is level (Roll: {self._current_roll:.1f}°, Pitch: {self._current_pitch:.1f}°)"
+        else:
+            return False, f"⚠️ Place drone level - Current: Roll {self._current_roll:.1f}°, Pitch {self._current_pitch:.1f}°"
+            
+     elif position_name == "Left":
+        # Left side: Roll should be around -90°, pitch near 0
+        roll_target = -90
+        roll_ok = abs(self._current_roll - roll_target) <= tolerance
+        pitch_ok = abs(self._current_pitch) <= tolerance
         
-        if position_name == "Level":
-            # Level: Roll and Pitch should be close to 0
-            if abs(self._current_roll) <= tolerance and abs(self._current_pitch) <= tolerance:
-                return True, f"✅ Drone is level (Roll: {self._current_roll:.1f}°, Pitch: {self._current_pitch:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone level - Current: Roll {self._current_roll:.1f}°, Pitch {self._current_pitch:.1f}°"
-                
-        elif position_name == "Left":
-            # Left side: Roll should be around -90°
-            target_roll = -90
-            if abs(self._current_roll - target_roll) <= tolerance and abs(self._current_pitch) <= tolerance:
-                return True, f"✅ Drone is on left side (Roll: {self._current_roll:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone on LEFT side - Current: Roll {self._current_roll:.1f}° (need ~-90°)"
-                
-        elif position_name == "Right":
-            # Right side: Roll should be around +90°
-            target_roll = 90
-            if abs(self._current_roll - target_roll) <= tolerance and abs(self._current_pitch) <= tolerance:
-                return True, f"✅ Drone is on right side (Roll: {self._current_roll:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone on RIGHT side - Current: Roll {self._current_roll:.1f}° (need ~+90°)"
-                
-        elif position_name == "Nose Down":
-            # CORRECTED: Nose down based on GPS direction - Pitch should be around -90° (nose pointing down)
-            target_pitch = -90
-            if abs(self._current_pitch - target_pitch) <= tolerance and abs(self._current_roll) <= tolerance:
-                return True, f"✅ Drone nose is down (Pitch: {self._current_pitch:.1f}°, GPS heading: {gps_heading_offset:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone NOSE DOWN (towards GPS direction) - Current: Pitch {self._current_pitch:.1f}° (need ~-90°)"
-                
-        elif position_name == "Nose Up":
-            # CORRECTED: Nose up (tail down) based on GPS direction - Pitch should be around +90° (nose pointing up)
-            target_pitch = 90
-            if abs(self._current_pitch - target_pitch) <= tolerance and abs(self._current_roll) <= tolerance:
-                return True, f"✅ Drone nose is up (Pitch: {self._current_pitch:.1f}°, GPS heading: {gps_heading_offset:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone NOSE UP (away from GPS direction, tail down) - Current: Pitch {self._current_pitch:.1f}° (need ~+90°)"
-                
-        elif position_name == "Back":
-            # Upside down: Roll should be around ±180°
-            if (abs(abs(self._current_roll) - 180) <= tolerance and 
-                abs(self._current_pitch) <= tolerance):
-                return True, f"✅ Drone is upside down (Roll: {self._current_roll:.1f}°)"
-            else:
-                return False, f"⚠️ Place drone UPSIDE DOWN - Current: Roll {self._current_roll:.1f}° (need ~±180°)"
+        if roll_ok and pitch_ok:
+            return True, f"✅ Drone is on left side (Roll: {self._current_roll:.1f}°)"
+        else:
+            return False, f"⚠️ Place drone on LEFT side - Current: Roll {self._current_roll:.1f}° (need ~-90°), Pitch {self._current_pitch:.1f}°"
+            
+     elif position_name == "Right":
+        # Right side: Roll should be around +90°, pitch near 0
+        roll_target = 90
+        roll_ok = abs(self._current_roll - roll_target) <= tolerance
+        pitch_ok = abs(self._current_pitch) <= tolerance
         
-        return False, f"Unknown position: {position_name}"
+        if roll_ok and pitch_ok:
+            return True, f"✅ Drone is on right side (Roll: {self._current_roll:.1f}°)"
+        else:
+            return False, f"⚠️ Place drone on RIGHT side - Current: Roll {self._current_roll:.1f}° (need ~+90°), Pitch {self._current_pitch:.1f}°"
+            
+     elif position_name == "Nose Down":
+        # Nose down: Pitch should be around +90° (nose pointing down towards ground)
+        # Roll should be near 0
+        pitch_target = 90
+        pitch_ok = abs(self._current_pitch - pitch_target) <= tolerance
+        roll_ok = abs(self._current_roll) <= tolerance
+        
+        gps_info = f", GPS heading: {gps_heading:.1f}°" if has_gps_lock else " (No GPS lock)"
+        
+        if pitch_ok and roll_ok:
+            return True, f"✅ Drone nose is down (Pitch: {self._current_pitch:.1f}°{gps_info})"
+        else:
+            return False, f"⚠️ Place drone NOSE DOWN (vertical, nose to ground) - Current: Pitch {self._current_pitch:.1f}° (need ~+90°), Roll {self._current_roll:.1f}°{gps_info}"
+            
+     elif position_name == "Nose Up":
+        # Nose up: Pitch should be around -90° (nose pointing up, tail down)
+        # Roll should be near 0
+        pitch_target = -90
+        pitch_ok = abs(self._current_pitch - pitch_target) <= tolerance
+        roll_ok = abs(self._current_roll) <= tolerance
+        
+        gps_info = f", GPS heading: {gps_heading:.1f}°" if has_gps_lock else " (No GPS lock)"
+        
+        if pitch_ok and roll_ok:
+            return True, f"✅ Drone nose is up (Pitch: {self._current_pitch:.1f}°{gps_info})"
+        else:
+            return False, f"⚠️ Place drone NOSE UP (vertical, tail to ground) - Current: Pitch {self._current_pitch:.1f}° (need ~-90°), Roll {self._current_roll:.1f}°{gps_info}"
+            
+     elif position_name == "Back":
+        # Upside down: Roll should be around ±180°, pitch near 0
+        # Accept either +180 or -180
+        roll_ok = (abs(abs(self._current_roll) - 180) <= tolerance)
+        pitch_ok = abs(self._current_pitch) <= tolerance
+        
+        if roll_ok and pitch_ok:
+            return True, f"✅ Drone is upside down (Roll: {self._current_roll:.1f}°)"
+        else:
+            return False, f"⚠️ Place drone UPSIDE DOWN - Current: Roll {self._current_roll:.1f}° (need ~±180°), Pitch {self._current_pitch:.1f}°"
+    
+     return False, f"Unknown position: {position_name}"
     
     # Additional calibration methods
     @pyqtSlot()
@@ -684,53 +742,63 @@ class CalibrationModel(QObject):
     # Enhanced Level Calibration Methods with Position Checking
     @pyqtSlot()
     def startLevelCalibration(self):
-        if not self.isDroneConnected:
-            self._set_feedback("Error: Drone not connected")
-            return False
+     if not self.isDroneConnected:
+        self._set_feedback("Error: Drone not connected")
+        return False
+        
+     if self._accel_calibration_active:
+        self._set_feedback("Error: Cannot start level calibration while accelerometer calibration is active")
+        return False
+    
+    # Store connection info for auto-reconnection
+     self._store_connection_info()
+    
+    # Start position checking first
+     self.startPositionCheck()
+    
+    # Check if drone is level
+     is_level, message = self._is_in_required_position("Level")
+    
+     if not is_level:
+        self._set_feedback(message + " - Level calibration requires drone to be level!")
+        return False
+        
+     print("[CalibrationModel] Starting level calibration - drone position verified")
+     self._level_calibration_active = True
+     self._level_calibration_complete = False
+     self._update_all_calibrations_status()
+    
+    # Send CORRECT MAVLink command for level calibration (accel simple calibration)
+     if self._drone_model and self._drone_model.drone_connection:
+        try:
+            # ArduPilot level calibration command:
+            # MAV_CMD_PREFLIGHT_CALIBRATION with param5=2 for simple accel calibration
+            self._drone_model.drone_connection.mav.command_long_send(
+                self._drone_model.drone_connection.target_system,
+                self._drone_model.drone_connection.target_component,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                0,  # confirmation
+                0,  # param1: gyro calibration
+                0,  # param2: magnetometer calibration
+                0,  # param3: ground pressure calibration
+                0,  # param4: radio calibration
+                2,  # param5: 2 = simple accel calibration (LEVEL ONLY)
+                0,  # param6: 
+                0   # param7:
+            )
+            print("[CalibrationModel] Sent SIMPLE level calibration command (param5=2)")
+            self._set_feedback("✅ Level calibration started - Keep drone level and still for 5 seconds...")
+            self._level_timer.start(5000)  # 5 second calibration
+            return True
             
-        if self._accel_calibration_active:
-            self._set_feedback("Error: Cannot start level calibration while accelerometer calibration is active")
+        except Exception as e:
+            print(f"[CalibrationModel] Error sending level calibration command: {e}")
+            self._set_feedback(f"Error: Failed to send calibration command - {e}")
+            self._level_calibration_active = False
+            self.stopPositionCheck()
+            self.calibrationStatusChanged.emit()
             return False
-        
-        # Store connection info for auto-reconnection
-        self._store_connection_info()
-        
-        # Start position checking first
-        self.startPositionCheck()
-        
-        # Check if drone is level
-        is_level, message = self._is_in_required_position("Level")
-        
-        if not is_level:
-            self._set_feedback(message + " - Level calibration requires drone to be level!")
-            return False
-            
-        print("[CalibrationModel] Starting level calibration - drone position verified")
-        self._level_calibration_active = True
-        self._level_calibration_complete = False
-        self._update_all_calibrations_status()
-        
-        # Send MAVLink command for level calibration
-        if self._drone_model and self._drone_model.drone_connection:
-            try:
-                self._drone_model.drone_connection.mav.command_long_send(
-                    self._drone_model.drone_connection.target_system,
-                    self._drone_model.drone_connection.target_component,
-                    mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-                    0, 1, 0, 0, 0, 0, 0, 0
-                )
-                print("[CalibrationModel] Sent level calibration command")
-            except Exception as e:
-                print(f"[CalibrationModel] Error sending level calibration command: {e}")
-                self._set_feedback(f"Error: Failed to send calibration command - {e}")
-                self._level_calibration_active = False
-                self.stopPositionCheck()
-                self.calibrationStatusChanged.emit()
-                return False
-        
-        self._set_feedback("✅ Level calibration started - Keep drone level and still...")
-        self._level_timer.start(5000)  # 5 second calibration
-        return True
+     return False
 
     @pyqtSlot()
     def stopLevelCalibration(self):
@@ -752,57 +820,68 @@ class CalibrationModel(QObject):
     # Enhanced Accelerometer Calibration Methods with Position Checking
     @pyqtSlot()
     def startAccelCalibration(self):
-        if not self.isDroneConnected:
-            self._set_feedback("Error: Drone not connected")
-            return False
+     if not self.isDroneConnected:
+        self._set_feedback("Error: Drone not connected")
+        return False
+        
+     if self._level_calibration_active:
+        self._set_feedback("Error: Cannot start accelerometer calibration while level calibration is active")
+        return False
+    
+    # Store connection info for auto-reconnection
+     self._store_connection_info()
+    
+     print("[CalibrationModel] Starting accelerometer calibration")
+     self._accel_calibration_active = True
+     self._accel_calibration_complete = False
+     self._current_step = 0
+     self._completed_steps = [False] * 6
+     self._all_positions_completed = False
+     self._update_all_calibrations_status()
+    
+    # Start position checking for first position
+     self.startPositionCheck()
+    
+    # Send CORRECT MAVLink command for full accelerometer calibration
+     if self._drone_model and self._drone_model.drone_connection:
+        try:
+            # ArduPilot full accel calibration command:
+            # MAV_CMD_PREFLIGHT_CALIBRATION with param5=1 for full 6-position accel calibration
+            self._drone_model.drone_connection.mav.command_long_send(
+                self._drone_model.drone_connection.target_system,
+                self._drone_model.drone_connection.target_component,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                0,  # confirmation
+                0,  # param1: gyro calibration
+                0,  # param2: magnetometer calibration
+                0,  # param3: ground pressure calibration
+                0,  # param4: radio calibration
+                1,  # param5: 1 = full accel calibration (6 positions)
+                0,  # param6: 
+                0   # param7:
+            )
+            print("[CalibrationModel] Sent FULL accelerometer calibration command (param5=1)")
             
-        if self._level_calibration_active:
-            self._set_feedback("Error: Cannot start accelerometer calibration while level calibration is active")
+            # Check initial position
+            required_position = self._position_names[self._current_step]
+            is_correct, message = self._is_in_required_position(required_position)
+            
+            if is_correct:
+                self._set_feedback(f"✅ Accelerometer calibration started - Drone is in correct position: {required_position}")
+            else:
+                self._set_feedback(f"⚠️ {message} - Move to position: {required_position}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[CalibrationModel] Error sending accel calibration command: {e}")
+            self._set_feedback(f"Error: Failed to send calibration command - {e}")
+            self._accel_calibration_active = False
+            self.stopPositionCheck()
+            self.calibrationStatusChanged.emit()
             return False
-        
-        # Store connection info for auto-reconnection
-        self._store_connection_info()
-        
-        print("[CalibrationModel] Starting accelerometer calibration")
-        self._accel_calibration_active = True
-        self._accel_calibration_complete = False
-        self._current_step = 0
-        self._completed_steps = [False] * 6
-        self._all_positions_completed = False
-        self._update_all_calibrations_status()
-        
-        # Start position checking for first position
-        self.startPositionCheck()
-        
-        # Send MAVLink command for accelerometer calibration
-        if self._drone_model and self._drone_model.drone_connection:
-            try:
-                self._drone_model.drone_connection.mav.command_long_send(
-                    self._drone_model.drone_connection.target_system,
-                    self._drone_model.drone_connection.target_component,
-                    mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-                    0, 0, 0, 0, 0, 1, 0, 0
-                )
-                print("[CalibrationModel] Sent accelerometer calibration command")
-            except Exception as e:
-                print(f"[CalibrationModel] Error sending accel calibration command: {e}")
-                self._set_feedback(f"Error: Failed to send calibration command - {e}")
-                self._accel_calibration_active = False
-                self.stopPositionCheck()
-                self.calibrationStatusChanged.emit()
-                return False
-        
-        # Check initial position
-        required_position = self._position_names[self._current_step]
-        is_correct, message = self._is_in_required_position(required_position)
-        
-        if is_correct:
-            self._set_feedback(f"✅ Accelerometer calibration started - Drone is in correct position: {required_position}")
-        else:
-            self._set_feedback(f"⚠️ {message} - Move to position: {required_position}")
-        
-        return True
-
+     return False
+    
     @pyqtSlot()
     def stopAccelCalibration(self):
         print("[CalibrationModel] Stopping accelerometer calibration")
@@ -817,45 +896,85 @@ class CalibrationModel(QObject):
 
     @pyqtSlot()
     def nextPosition(self):
-        if not self._accel_calibration_active or not self.isDroneConnected:
-            return
+     if not self._accel_calibration_active or not self.isDroneConnected:
+        return
+    
+    # Check if current position is correct before proceeding
+     current_position = self._position_names[self._current_step]
+     is_correct, message = self._is_in_required_position(current_position)
+    
+     if not is_correct:
+        self._set_feedback(f"❌ {message} - Cannot proceed until drone is in correct position!")
+        return
         
-        # Check if current position is correct before proceeding
-        current_position = self._position_names[self._current_step]
-        is_correct, message = self._is_in_required_position(current_position)
-        
-        if not is_correct:
-            self._set_feedback(f"❌ {message} - Cannot proceed until drone is in correct position!")
-            return
+    # Mark current position as completed
+     self._completed_steps[self._current_step] = True
+    
+    # Send MAVLink ACK for this position to ArduPilot
+     if self._drone_model and self._drone_model.drone_connection:
+        try:
+            # Send MAV_CMD_ACCELCAL_VEHICLE_POS to confirm position
+            # Position mapping: 0=level, 1=left, 2=right, 3=nosedown, 4=noseup, 5=back
+            self._drone_model.drone_connection.mav.command_long_send(
+                self._drone_model.drone_connection.target_system,
+                self._drone_model.drone_connection.target_component,
+                mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
+                0,  # confirmation
+                self._current_step + 1,  # param1: position (1-6, not 0-5)
+                0, 0, 0, 0, 0, 0
+            )
+            print(f"[CalibrationModel] Sent position {self._current_step + 1} ({current_position}) confirmation to ArduPilot")
             
-        # Mark current position as completed
-        self._completed_steps[self._current_step] = True
+        except Exception as e:
+            print(f"[CalibrationModel] Error sending position confirmation: {e}")
+    
+     if self._current_step < 5:  # 0-5 = 6 positions
+        self._current_step += 1
+        next_position = self._position_names[self._current_step]
         
-        # Send position completion to the connected drone
-        if self._drone_model and self._drone_model.drone_connection:
-            try:
-                print(f"[CalibrationModel] Position {self._current_step + 1} ({current_position}) completed and verified")
-            except Exception as e:
-                print(f"[CalibrationModel] Error processing position: {e}")
+        # Check if drone is already in next position
+        is_next_correct, next_message = self._is_in_required_position(next_position)
         
-        if self._current_step < 5:  # 0-5 = 6 positions
-            self._current_step += 1
-            next_position = self._position_names[self._current_step]
-            
-            # Check if drone is already in next position
-            is_next_correct, next_message = self._is_in_required_position(next_position)
-            
-            if is_next_correct:
-                self._set_feedback(f"✅ Position {self._current_step} completed. Drone is already in correct position: {next_position}")
-            else:
-                self._set_feedback(f"✅ Position {self._current_step} completed. {next_message}")
+        if is_next_correct:
+            self._set_feedback(f"✅ Position {self._current_step} completed. Drone is already in correct position: {next_position}")
         else:
-            self._all_positions_completed = True
-            self.stopPositionCheck()
-            self._set_feedback("🎉 All positions completed and verified! Click 'Done' to finish.")
-        
-        self.accelCalibrationProgressChanged.emit()
+            self._set_feedback(f"✅ Position {self._current_step} completed. {next_message}")
+     else:
+        self._all_positions_completed = True
+        self.stopPositionCheck()
+        self._set_feedback("🎉 All positions completed and verified! Click 'Done' to finish.")
+    
+     self.accelCalibrationProgressChanged.emit()
 
+    def _listen_for_calibration_progress(self):
+     """Listen for STATUSTEXT messages from ArduPilot during calibration"""
+     if not self._drone_model or not self._drone_model.drone_connection:
+        return
+        
+     try:
+        # Check for STATUSTEXT messages (non-blocking)
+        status_msg = self._drone_model.drone_connection.recv_match(
+            type='STATUSTEXT', blocking=False, timeout=0
+        )
+        
+        if status_msg:
+            text = status_msg.text
+            print(f"[CalibrationModel] ArduPilot: {text}")
+            
+            # Parse calibration messages
+            if "Place" in text or "position" in text.lower():
+                self._set_feedback(f"📍 ArduPilot: {text}")
+            elif "Calibration" in text:
+                if "successful" in text.lower() or "complete" in text.lower():
+                    self._set_feedback(f"✅ {text}")
+                elif "failed" in text.lower() or "error" in text.lower():
+                    self._set_feedback(f"❌ {text}")
+                else:
+                    self._set_feedback(f"ℹ️ {text}")
+                    
+     except Exception as e:
+        pass  # Ignore read errors
+    
     @pyqtSlot()
     def completeAccelCalibration(self):
         if not self.isDroneConnected:
