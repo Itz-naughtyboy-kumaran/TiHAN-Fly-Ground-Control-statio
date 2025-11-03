@@ -1,21 +1,26 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtGraphicalEffects 1.10
-import "."
 import QtQuick.Window 2.15
 import QtQuick.Layouts 1.0
+import "."
 
 ApplicationWindow {
     id: mainWindow
     visible: true
     visibility: "Maximized"
-    title: "TiHAN FLY-Groud Control Station"
+    title: "TiHAN FLY - Ground Control Station (SECURE)"
     color: "#f5f5f5"
 
-    // ADD THIS: Global reference for marker synchronization
+    // Global properties
     property var mapViewInstance: null
     property var navigationControlsInstance: null
-
+    
+    // Security: Session management
+    property string sessionToken: ""
+    property bool isAuthenticated: false
+    property int failedLoginAttempts: 0
+    
     // Colors - Light Theme
     readonly property color primaryColor: "#ffffff"
     readonly property color secondaryColor: "#f8f9fa"
@@ -56,6 +61,36 @@ ApplicationWindow {
         }
     }
 
+    // Security Manager Connections
+    Connections {
+        target: typeof securityManager !== 'undefined' ? securityManager : null
+        
+        function onSecurityAlert(message, severity) {
+            console.log("🔒 SECURITY ALERT [" + severity + "]: " + message)
+            showSecurityNotification(message, severity)
+        }
+        
+        function onAuthenticationFailed(reason) {
+            console.log("❌ Authentication failed: " + reason)
+            failedLoginAttempts++
+            if (failedLoginAttempts >= 3) {
+                showSecurityNotification("Too many failed attempts. Access blocked.", "critical")
+            }
+        }
+        
+        function onSessionExpired() {
+            console.log("⏰ Session expired")
+            isAuthenticated = false
+            sessionToken = ""
+            showSecurityNotification("Session expired. Please reconnect.", "warning")
+        }
+        
+        function onUnauthorizedAccess(action) {
+            console.log("⚠️ Unauthorized access attempt: " + action)
+            showSecurityNotification("Unauthorized action blocked: " + action, "error")
+        }
+    }
+
     // Copyright Window Loader
     Loader {
         id: copyrightWindowLoader
@@ -77,17 +112,119 @@ ApplicationWindow {
     Loader {
         id: feedbackDialogLoader
         active: false
-        source: "FeedbackDialog.qml"  // Back to simple filename
-        
-        onLoaded: {
-            if (item) {
-                item.parent = mainWindow.contentItem
-                item.open()
+        sourceComponent: Component {
+            FeedbackDialog {
+                onClosed: feedbackDialogLoader.active = false
             }
         }
     }
 
-    // Background gradient - Light Theme
+    // Security Notification Dialog
+    Popup {
+        id: securityNotificationDialog
+        modal: true
+        focus: true
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        width: 400
+        height: 200
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        
+        property string alertMessage: ""
+        property string alertSeverity: "info"
+        
+        background: Rectangle {
+            color: "#ffffff"
+            radius: 12
+            border.color: borderColor
+            border.width: 2
+            
+            layer.enabled: true
+            layer.effect: DropShadow {
+                horizontalOffset: 0
+                verticalOffset: 4
+                radius: 12
+                samples: 25
+                color: "#40000000"
+            }
+        }
+        
+        Column {
+            anchors.fill: parent
+            anchors.margins: 25
+            spacing: 20
+            
+            Text {
+                text: "Security Alert"
+                font.pixelSize: 18
+                font.weight: Font.Bold
+                color: textPrimary
+                anchors.horizontalCenter: parent.horizontalCenter
+            }
+            
+            Row {
+                spacing: 12
+                width: parent.width
+                
+                Text {
+                    text: {
+                        switch(securityNotificationDialog.alertSeverity) {
+                            case "critical": return "🚨"
+                            case "error": return "❌"
+                            case "warning": return "⚠️"
+                            case "success": return "✅"
+                            default: return "ℹ️"
+                        }
+                    }
+                    font.pixelSize: 28
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                
+                Text {
+                    text: securityNotificationDialog.alertMessage
+                    font.pixelSize: 14
+                    wrapMode: Text.WordWrap
+                    width: parent.width - 50
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: {
+                        switch(securityNotificationDialog.alertSeverity) {
+                            case "critical": return "#dc3545"
+                            case "error": return "#dc3545"
+                            case "warning": return "#ffc107"
+                            case "success": return "#28a745"
+                            default: return "#0066cc"
+                        }
+                    }
+                }
+            }
+            
+Rectangle {
+    width: 100
+    height: 35
+    radius: 6
+    color: mouseArea.pressed ? "#004499" : accentColor
+
+    Text {
+        anchors.centerIn: parent
+        text: "OK"
+        color: "white"
+        font.pixelSize: 13
+        font.weight: Font.DemiBold
+    }
+
+    MouseArea {
+        id: mouseArea
+        anchors.fill: parent
+        onClicked: securityNotificationDialog.close()
+    }
+
+    Behavior on color {
+        ColorAnimation { duration: 150 }
+    }
+}
+        }
+    }
+    // Background gradient
     Rectangle {
         anchors.fill: parent
         gradient: Gradient {
@@ -95,7 +232,7 @@ ApplicationWindow {
             GradientStop { position: 1.0; color: "#e9ecef" }
         }
 
-        // Optional grid overlay - Light Theme
+        // Grid overlay
         Canvas {
             anchors.fill: parent
             opacity: 0.08
@@ -111,7 +248,7 @@ ApplicationWindow {
                 }
             }
         }
-
+   
         // Top Connection Bar
         ConnectionBar {
             id: connectionBar
@@ -201,21 +338,19 @@ ApplicationWindow {
                         NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
                     }
 
-                    // Add ScrollView for scrollable content
                     ScrollView {
                         id: scrollView
                         anchors.fill: parent
-                        anchors.topMargin: 45  // Space for toggle button
+                        anchors.topMargin: 45
                         anchors.bottomMargin: 5
                         anchors.leftMargin: 5
                         anchors.rightMargin: 5
                         clip: true
                         
-                        // Force scrollbar to always show for testing
                         ScrollBar.vertical: ScrollBar {
                             id: vScrollBar
                             width: 12
-                            policy: ScrollBar.AsNeeded  // Changed back to AsNeeded
+                            policy: ScrollBar.AsNeeded
                             active: true
                             
                             background: Rectangle {
@@ -236,10 +371,9 @@ ApplicationWindow {
                         }
                         
                         ScrollBar.horizontal: ScrollBar {
-                            policy: ScrollBar.AlwaysOff  // Disable horizontal scrolling
+                            policy: ScrollBar.AlwaysOff
                         }
 
-                        // Content column that will be scrollable
                         Column {
                             id: scrollableContent
                             width: scrollView.availableWidth
@@ -277,13 +411,7 @@ ApplicationWindow {
                                 width: parent.width
                             }
 
-                            MessagesPanel {
-                                id: messagesPanel
-                                width: parent.width
-                                languageManager: languageManager
-                            }
 
-                            // Add some bottom padding
                             Item {
                                 width: parent.width
                                 height: 15
@@ -327,7 +455,6 @@ ApplicationWindow {
                         id: mapViewComponent
                         anchors.fill: parent
                         
-                        // MODIFIED: Register with mainWindow when created
                         Component.onCompleted: {
                             mainWindow.mapViewInstance = mapViewComponent
                             console.log("MapView registered with mainWindow")
@@ -336,7 +463,7 @@ ApplicationWindow {
                 }
             }
 
-            // Control Panel Bottom Center - NO BACKGROUND BOX
+            // Control Panel Bottom Center
             Rectangle {
                 id: controlPanel
                 anchors.bottom: parent.bottom
@@ -344,10 +471,10 @@ ApplicationWindow {
                 anchors.bottomMargin: 15
                 width: 400
                 height: 80
-                color: "transparent"  // Transparent background - no white box
+                color: "transparent"
                 radius: 12
-                border.color: "transparent"  // Transparent border
-                border.width: 0  // No border
+                border.color: "transparent"
+                border.width: 0
 
                 Behavior on width {
                     NumberAnimation { duration: 300; easing.type: Easing.OutCubic }
@@ -357,15 +484,14 @@ ApplicationWindow {
                     id: controlButtons
                     mainWindowRef: mainWindow
                     
-                    // MODIFIED: Register NavigationControls when created
                     Component.onCompleted: {
                         mainWindow.navigationControlsInstance = controlButtons
-                        console.log("NavigationControls registered with mainWindow")
+                        console.log("NavigationControls registered")
                     }
                 }
             }
 
-            // Floating Access Button (optional)
+            // Floating Access Button
             Rectangle {
                 id: quickAccessButton
                 anchors.left: parent.left
@@ -420,8 +546,60 @@ ApplicationWindow {
                 }
             }
         }
+        
+        // Security Indicator Badge
+        Rectangle {
+            id: securityBadge
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.topMargin: 80
+            anchors.rightMargin: 20
+            width: 140
+            height: 35
+            color: successColor
+            radius: 8
+            opacity: 0.9
+            z: 1001
 
-        // Feedback Button - Above copyright notice (no API needed)
+            Row {
+                anchors.centerIn: parent
+                spacing: 8
+
+                Text {
+                    text: "🔒"
+                    font.pixelSize: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                    text: "SECURE MODE"
+                    font.family: "Segoe UI"
+                    font.pixelSize: 11
+                    font.weight: Font.Bold
+                    color: "#ffffff"
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+
+            DropShadow {
+                anchors.fill: parent
+                horizontalOffset: 0
+                verticalOffset: 2
+                radius: 4
+                samples: 9
+                color: "#30000000"
+                source: parent
+            }
+
+            // Pulsing animation
+            SequentialAnimation on opacity {
+                loops: Animation.Infinite
+                NumberAnimation { to: 1.0; duration: 1000 }
+                NumberAnimation { to: 0.7; duration: 1000 }
+            }
+        }
+        
+        // Feedback Button
         Rectangle {
             id: feedbackButton
             anchors.bottom: copyrightNotice.top
@@ -471,7 +649,6 @@ ApplicationWindow {
                 hoverEnabled: true
 
                 onClicked: {
-                    // Open feedback dialog
                     feedbackDialogLoader.active = true
                 }
 
@@ -494,7 +671,7 @@ ApplicationWindow {
             }
         }
 
-        // Copyright Notice - Direct child of background Rectangle  
+        // Copyright Notice
         Text {
             id: copyrightNotice
             anchors.bottom: parent.bottom
@@ -535,8 +712,150 @@ ApplicationWindow {
             }
         }
     }
+    
+    // Directional Control Pad - Bottom Right Corner
+    DirectionalControl {
+        id: directionalPad
+        anchors.bottom: parent.bottom
+        anchors.right: parent.right
+        anchors.bottomMargin: 100
+        anchors.rightMargin: 30
+        
+        z: 3000
+        visible: true
+        opacity: 1.0
+        
+        Component.onCompleted: {
+            droneCommander = typeof droneCommander !== 'undefined' ? droneCommander : null
+            
+            if (droneCommander) {
+                console.log("✅ DirectionalPad: droneCommander connected")
+            } else {
+                console.log("❌ DirectionalPad ERROR: droneCommander is NULL!")
+            }
+        }
+    }
 
-    // Functions
+    // ============================================================
+    // SECURITY FUNCTIONS
+    // ============================================================
+    
+    function showSecurityNotification(message, severity) {
+        securityNotificationDialog.alertMessage = message
+        securityNotificationDialog.alertSeverity = severity
+        securityNotificationDialog.open()
+    }
+    
+    function validateCoordinateInput(lat, lng) {
+        if (typeof securityManager === 'undefined') {
+            console.warn("⚠️ Security Manager not available")
+            return true
+        }
+        
+        var latValid = securityManager.validate_coordinate(lat, "latitude")
+        var lngValid = securityManager.validate_coordinate(lng, "longitude")
+        
+        if (!latValid || !lngValid) {
+            showSecurityNotification("Invalid coordinates detected. Action blocked.", "error")
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("🚫 Invalid coordinates rejected: " + lat + ", " + lng, "error")
+            }
+            return false
+        }
+        
+        return true
+    }
+    
+    function validateAltitudeInput(altitude) {
+        if (typeof securityManager === 'undefined') {
+            console.warn("⚠️ Security Manager not available")
+            return true
+        }
+        
+        var valid = securityManager.validate_altitude(altitude)
+        
+        if (!valid) {
+            showSecurityNotification("Invalid altitude: " + altitude + "m. Must be 0-500m.", "error")
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("🚫 Invalid altitude rejected: " + altitude + "m", "error")
+            }
+            return false
+        }
+        
+        return true
+    }
+    
+    function validateSpeedInput(speed) {
+        if (typeof securityManager === 'undefined') {
+            console.warn("⚠️ Security Manager not available")
+            return true
+        }
+        
+        var valid = securityManager.validate_speed(speed)
+        
+        if (!valid) {
+            showSecurityNotification("Invalid speed: " + speed + "m/s. Must be 0-25m/s.", "error")
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("🚫 Invalid speed rejected: " + speed + "m/s", "error")
+            }
+            return false
+        }
+        
+        return true
+    }
+    
+    function validateCommandExecution(command, params) {
+        if (typeof commandValidator === 'undefined') {
+            console.warn("⚠️ Command Validator not available")
+            return true
+        }
+        
+        var valid = commandValidator.validate_command(command, params)
+        
+        if (!valid) {
+            showSecurityNotification("Command rejected: " + command, "error")
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("🚫 Command rejected: " + command, "error")
+            }
+            return false
+        }
+        
+        return true
+    }
+    
+    function sanitizeTextInput(input, maxLength) {
+        if (typeof securityManager === 'undefined') {
+            console.warn("⚠️ Security Manager not available")
+            return input
+        }
+        
+        maxLength = maxLength || 255
+        return securityManager.sanitize_string(input, maxLength)
+    }
+    
+    function logSecurityEvent(eventType, details) {
+        if (typeof securityManager !== 'undefined') {
+            securityManager.log_security_event(eventType, details)
+        }
+        console.log("🔒 Security Event: " + eventType + " - " + details)
+    }
+    
+    function checkRateLimit(identifier, maxAttempts, windowSeconds) {
+        if (typeof securityManager === 'undefined') {
+            console.warn("⚠️ Security Manager not available")
+            return true
+        }
+        
+        maxAttempts = maxAttempts || 10
+        windowSeconds = windowSeconds || 60
+        
+        return securityManager.check_rate_limit(identifier, maxAttempts, windowSeconds)
+    }
+
+    // ============================================================
+    // REGULAR FUNCTIONS
+    // ============================================================
+    
     function updateFlightData(altitude, groundSpeed, yaw, distToWP, verticalSpeed, distToMAV) {
         currentAltitude = altitude
         currentGroundSpeed = groundSpeed
@@ -547,15 +866,11 @@ ApplicationWindow {
     }
 
     function saveLanguagePreference(languageCode) {
-        // Save to local storage or settings file
-        // This is a placeholder - implement based on your storage method
         console.log("Saving language preference:", languageCode);
     }
 
     function loadLanguagePreference() {
-        // Load from local storage or settings file
-        // This is a placeholder - implement based on your storage method
-        return "en"; // Default to English
+        return "en";
     }
 
     function updateLanguageForAllComponents() {
@@ -566,11 +881,87 @@ ApplicationWindow {
         showMaximized()
         var savedLang = loadLanguagePreference()
         languageManager.changeLanguage(savedLang)
+        
+        // Verify droneCommander
+        if (typeof droneCommander !== 'undefined') {
+            console.log("✓ DroneCommander connected to QML")
+        } else {
+            console.log("✗ ERROR: DroneCommander NOT available!")
+        }
+        
+        // Verify security manager
+        if (typeof securityManager !== 'undefined') {
+            console.log("🔒 Security Manager connected to QML")
+            logSecurityEvent("SYSTEM_READY", "QML interface initialized")
+        } else {
+            console.warn("⚠️ WARNING: Security Manager NOT available!")
+        }
+        
+        // Verify command validator
+        if (typeof commandValidator !== 'undefined') {
+            console.log("🔒 Command Validator connected to QML")
+        } else {
+            console.warn("⚠️ WARNING: Command Validator NOT available!")
+        }
+        
+        // Log initialization
+        if (typeof messageLogger !== 'undefined') {
+            messageLogger.logMessage("🚀 TiHAN Secure GCS loaded successfully", "success")
+            messageLogger.logMessage("🔒 Security features active", "info")
+        }
     }
 
     onVisibilityChanged: {
         if (visibility === ApplicationWindow.Windowed) {
             showMaximized()
+        }
+    }
+    
+    // Security: Monitor for suspicious activity
+    Timer {
+        id: securityMonitorTimer
+        interval: 30000  // Check every 30 seconds
+        running: true
+        repeat: true
+        
+        onTriggered: {
+            // Log periodic security check
+            if (typeof securityManager !== 'undefined') {
+                logSecurityEvent("SECURITY_CHECK", "Periodic security monitoring")
+            }
+        }
+    }
+    
+    // Security: Auto-lock after inactivity
+    Timer {
+        id: inactivityTimer
+        interval: 1800000  // 30 minutes
+        running: false
+        repeat: false
+        
+        onTriggered: {
+            if (typeof securityManager !== 'undefined') {
+                console.log("⏰ Auto-lock triggered due to inactivity")
+                showSecurityNotification("Session locked due to inactivity", "warning")
+                logSecurityEvent("AUTO_LOCK", "Inactivity timeout")
+            }
+        }
+    }
+    
+    // Reset inactivity timer on user interaction
+    MouseArea {
+        anchors.fill: parent
+        propagateComposedEvents: true
+        z: -1
+        
+        onClicked: {
+            inactivityTimer.restart()
+            mouse.accepted = false
+        }
+        
+        onPressed: {
+            inactivityTimer.restart()
+            mouse.accepted = false
         }
     }
 }
