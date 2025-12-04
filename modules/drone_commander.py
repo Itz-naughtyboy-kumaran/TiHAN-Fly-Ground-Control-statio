@@ -1,4 +1,6 @@
 import time
+import queue
+import threading
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, pyqtProperty, QThread
 from PyQt5.QtTextToSpeech import QTextToSpeech
 from pymavlink import mavutil
@@ -9,19 +11,31 @@ from pymavlink.dialects.v20 import ardupilotmega as mavutil_ardupilot
 class DroneCommander(QObject):
     commandFeedback = pyqtSignal(str)
     armDisarmCompleted = pyqtSignal(bool, str)
-    parametersUpdated = pyqtSignal(dict)
+    parametersUpdated = pyqtSignal()  # FIXED: No arguments, QML will read property
+    parameterReceived = pyqtSignal(str, float)  # Individual parameter updates
 
+   # Add to __init__
     def __init__(self, drone_model):
-        super().__init__()
-        self.drone_model = drone_model
-        self._parameters = {}
-        
-        # Initialize Text-to-Speech
-        self.tts = QTextToSpeech(self)
-        self.tts.setRate(0.0)  # Normal speed
-        self.tts.setVolume(1.0)  # Full volume
-        
-        print("[DroneCommander] Initialized with TTS support.")
+     super().__init__()
+     self.drone_model = drone_model
+     self._parameters = {}
+     self._param_lock = threading.Lock()
+     self._fetching_params = False
+     self._param_queue = queue.Queue()
+     self._param_request_active = False
+    
+    # Mode change protection
+     self._mode_change_in_progress = False
+     self._mode_change_lock = threading.Lock()
+     self._last_mode_change_time = 0
+     self._mode_change_cooldown = 0.5
+    
+    # Initialize Text-to-Speech
+     self.tts = QTextToSpeech(self)
+     self.tts.setRate(0.0)
+     self.tts.setVolume(1.0)
+    
+     print("[DroneCommander] Initialized with non-blocking mode change.")
 
     def _speak(self, message):
         """Helper method to speak messages"""
@@ -243,45 +257,74 @@ class DroneCommander(QObject):
 
     @pyqtSlot(float, result=bool)
     def takeoff(self, target_altitude):
-     """
-     Simple takeoff command with automatic mode change to GUIDED
-     """
+     """Takeoff command with automatic arming and mode change to GUIDED"""
      if not self._is_drone_ready(): 
         self.commandFeedback.emit("Error: Drone not connected.")
         self._speak("Error. Drone not connected.")
         return False
-    
+
      print(f"\n[DroneCommander] ===== TAKEOFF REQUEST =====")
      print(f"[DroneCommander] Target altitude: {target_altitude}m")
-    
-    # Step 1: Check if armed
+
+    # Step 1: Check if armed, if not - ARM automatically
      is_armed = self.drone_model.telemetry.get('armed', False)
      print(f"[DroneCommander] Armed state: {is_armed}")
-     if not is_armed:
-        self.commandFeedback.emit("Error: Drone must be armed before takeoff.")
-        self._speak("Error. Drone must be armed before takeoff.")
-        return False
     
+     if not is_armed:
+        print("[DroneCommander] Drone not armed - arming automatically...")
+        self.commandFeedback.emit("Arming drone automatically...")
+        self._speak("Arming drone for takeoff.")
+        
+        # Send ARM commands
+        for i in range(5):
+            self._drone.mav.command_long_send(
+                self._drone.target_system,
+                self._drone.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                1,  # 1 = ARM
+                0, 0, 0, 0, 0, 0
+            )
+            time.sleep(0.1)
+        
+        # Wait for armed confirmation (up to 5 seconds)
+        start_time = time.time()
+        armed_success = False
+        while time.time() - start_time < 5:
+            is_armed = self.drone_model.telemetry.get('armed', False)
+            if is_armed:
+                print("[DroneCommander] Drone armed successfully")
+                self.commandFeedback.emit("Drone armed successfully!")
+                armed_success = True
+                break
+            time.sleep(0.1)
+        
+        if not armed_success:
+            self.commandFeedback.emit("Error: Failed to arm drone - check pre-arm checks")
+            self._speak("Error. Failed to arm drone. Check pre-arm checks.")
+            return False
+        
+        time.sleep(0.5)  # Small delay after arming
+
     # Step 2: Check GPS
      current_lat = self.drone_model.telemetry.get('lat')
      current_lon = self.drone_model.telemetry.get('lon')
      print(f"[DroneCommander] GPS position: lat={current_lat}, lon={current_lon}")
-    
+
      if current_lat is None or current_lon is None:
         self.commandFeedback.emit("Error: GPS position not available.")
         self._speak("Error. G P S position not available.")
         return False
-    
+
     # Step 3: Automatically change to GUIDED mode if not already
      current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
      print(f"[DroneCommander] Current mode: {current_mode}")
-    
+
      if current_mode != 'GUIDED':
         print("[DroneCommander] Changing mode to GUIDED for takeoff...")
         self.commandFeedback.emit("Changing to GUIDED mode for takeoff...")
         self._speak("Changing to guided mode.")
         
-        # Send mode change command
         mode_id = self._drone.mode_mapping().get('GUIDED')
         if mode_id is not None:
             for i in range(3):
@@ -301,29 +344,25 @@ class DroneCommander(QObject):
                     break
                 time.sleep(0.1)
             
-            time.sleep(0.3)  # Small delay after mode change
-    
-    # Step 4: Get initial altitude
+            time.sleep(0.3)
+
+    # Step 4: Get initial altitude and send takeoff command
      initial_alt = self.drone_model.telemetry.get('alt', 0)
      print(f"[DroneCommander] Initial altitude: {initial_alt}m")
      print(f"[DroneCommander] Sending TAKEOFF command to {target_altitude}m...")
-    
+
      self._speak(f"Drone taking off to {int(target_altitude)} meters altitude.")
-    
+
      try:
-        # Send takeoff command
         self._drone.mav.command_long_send(
             self._drone.target_system,
             self._drone.target_component,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0,  # confirmation
-            0,  # param1: pitch
-            0,  # param2: empty
-            0,  # param3: empty
-            0,  # param4: yaw angle
-            current_lat,  # param5: latitude
-            current_lon,  # param6: longitude
-            target_altitude  # param7: altitude
+            0,
+            0, 0, 0, 0,
+            current_lat,
+            current_lon,
+            target_altitude
         )
         
         self.commandFeedback.emit(f"Takeoff command sent to {target_altitude}m. Monitoring...")
@@ -334,7 +373,6 @@ class DroneCommander(QObject):
         while time.time() - start_time < 3:
             current_alt = self.drone_model.telemetry.get('alt', initial_alt)
             
-            # If altitude increased, takeoff is working
             if current_alt > initial_alt + 0.5:
                 success_msg = f"Takeoff initiated! Climbing to {target_altitude}m (current: {current_alt:.1f}m)"
                 self.commandFeedback.emit(success_msg)
@@ -344,15 +382,9 @@ class DroneCommander(QObject):
             
             time.sleep(0.1)
         
-        # After 3 seconds, check final altitude
-        final_alt = self.drone_model.telemetry.get('alt', initial_alt)
-        print(f"[DroneCommander] After 3s - altitude: {final_alt}m (started at {initial_alt}m)")
-        
-        # Assume success if command was sent (drone might be climbing slowly)
         success_msg = f"Takeoff command sent successfully to {target_altitude}m"
         self.commandFeedback.emit(success_msg)
         self._speak("Takeoff command sent successfully.")
-        print(f"[DroneCommander] Takeoff command sent (altitude may be changing: {final_alt}m)")
         return True
         
      except Exception as e:
@@ -364,106 +396,284 @@ class DroneCommander(QObject):
 
     @pyqtSlot(result=bool)
     def land(self):
-        if not self._is_drone_ready(): 
-            self.commandFeedback.emit("Error: Drone not connected.")
-            self._speak("Error. Drone not connected.")
+     """Land command with automatic disarm after landing"""
+     if not self._is_drone_ready(): 
+        self.commandFeedback.emit("Error: Drone not connected.")
+        self._speak("Error. Drone not connected.")
+        return False
+        
+     if self.drone_model.telemetry.get('lat') is None or self.drone_model.telemetry.get('lon') is None:
+        self.commandFeedback.emit("Error: GPS position not available for land.")
+        self._speak("Error. G P S position not available for landing.")
+        print("[DroneCommander] Land failed: GPS position not available.")
+        return False
+
+     print("[DroneCommander] Sending LAND command...")
+     self._speak("Drone landing initiated.")
+    
+     try:
+        # Send land command
+        self._drone.mav.command_long_send(
+            self._drone.target_system,
+            self._drone.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND,
+            0,
+            0, 0, 0, 0,
+            self.drone_model.telemetry['lat'],
+            self.drone_model.telemetry['lon'],
+            0
+        )
+        self.commandFeedback.emit("Land command sent. Monitoring landing...")
+
+        # Wait for command acknowledgment
+        ack_result = self._wait_for_command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND)
+        
+        if ack_result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            self.commandFeedback.emit("Landing initiated successfully!")
+            self._speak("Landing initiated successfully.")
+            
+            # Start monitoring thread for automatic disarm after landing
+            disarm_thread = threading.Thread(target=self._monitor_landing_and_disarm, daemon=True)
+            disarm_thread.start()
+            
+            return True
+        else:
+            self.commandFeedback.emit(f"Land command failed or denied. Result: {ack_result}")
+            self._speak("Land command failed or denied.")
             return False
             
-        if self.drone_model.telemetry.get('lat') is None or self.drone_model.telemetry.get('lon') is None:
-            self.commandFeedback.emit("Error: GPS position not available for land.")
-            self._speak("Error. G P S position not available for landing.")
-            print("[DroneCommander] Land failed: GPS position not available.")
-            return False
-
-        print("[DroneCommander] Sending LAND command...")
-        self._speak("Drone landing initiated.")
+     except Exception as e:
+        self.commandFeedback.emit(f"Error sending LAND command: {e}")
+        self._speak("Error sending land command.")
+        print(f"[DroneCommander ERROR] LAND command failed: {e}")
+        return False
+     
+    def _monitor_landing_and_disarm(self):
+     """Monitor landing progress and automatically disarm when landed"""
+     print("[DroneCommander] 🔍 Monitoring landing for automatic disarm...")
+    
+     try:
+        start_time = time.time()
+        timeout = 120  # 2 minutes timeout for landing
+        ground_time_threshold = 3  # seconds on ground before disarming
+        ground_start_time = None
         
-        try:
-            self._drone.mav.command_long_send(
-                self._drone.target_system,
-                self._drone.target_component,
-                mavutil.mavlink.MAV_CMD_NAV_LAND,
-                0,
-                0, 0, 0, 0,
-                self.drone_model.telemetry['lat'],
-                self.drone_model.telemetry['lon'],
-                0
-            )
-            self.commandFeedback.emit("Land command sent. Waiting for confirmation...")
-
-            ack_result = self._wait_for_command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND)
-            if ack_result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                self.commandFeedback.emit("Land initiated successfully!")
-                self._speak("Landing initiated successfully.")
-                return True
+        while time.time() - start_time < timeout:
+            # Get current altitude and armed state
+            current_alt = self.drone_model.telemetry.get('alt', None)
+            is_armed = self.drone_model.telemetry.get('armed', False)
+            current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+            
+            # Check if already disarmed
+            if not is_armed:
+                print("[DroneCommander] ✅ Drone already disarmed")
+                self.commandFeedback.emit("Drone landed and disarmed")
+                self._speak("Drone landed and disarmed.")
+                return
+            
+            # Check if on ground (altitude < 0.5m and armed)
+            if current_alt is not None and current_alt < 0.5:
+                if ground_start_time is None:
+                    ground_start_time = time.time()
+                    print(f"[DroneCommander] 🛬 Drone on ground (alt: {current_alt:.2f}m)")
+                
+                # Check if been on ground long enough
+                time_on_ground = time.time() - ground_start_time
+                if time_on_ground >= ground_time_threshold:
+                    print(f"[DroneCommander] ⏱️ On ground for {time_on_ground:.1f}s - disarming...")
+                    self.commandFeedback.emit("Landing complete - disarming drone...")
+                    self._speak("Landing complete. Disarming drone.")
+                    
+                    # Send disarm command
+                    for i in range(3):
+                        self._drone.mav.command_long_send(
+                            self._drone.target_system,
+                            self._drone.target_component,
+                            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                            0,
+                            0,  # 0 = DISARM
+                            0, 0, 0, 0, 0, 0
+                        )
+                        time.sleep(0.1)
+                    
+                    # Wait for disarm confirmation
+                    disarm_start = time.time()
+                    while time.time() - disarm_start < 3:
+                        is_armed = self.drone_model.telemetry.get('armed', False)
+                        if not is_armed:
+                            print("[DroneCommander] ✅ Automatic disarm successful!")
+                            self.commandFeedback.emit("✅ Drone disarmed automatically after landing")
+                            self._speak("Drone disarmed successfully.")
+                            self.armDisarmCompleted.emit(True, "Drone disarmed automatically after landing")
+                            return
+                        time.sleep(0.1)
+                    
+                    # Disarm command sent but not confirmed
+                    print("[DroneCommander] ⚠️ Disarm command sent but not confirmed")
+                    self.commandFeedback.emit("⚠️ Disarm command sent - check drone status")
+                    return
             else:
-                self.commandFeedback.emit(f"Land command failed or denied. Result: {ack_result}")
-                self._speak("Land command failed or denied.")
-                return False
-        except Exception as e:
-            self.commandFeedback.emit(f"Error sending LAND command: {e}")
-            self._speak("Error sending land command.")
-            print(f"[DroneCommander ERROR] LAND command failed: {e}")
-            return False
+                # Reset ground timer if altitude increases
+                if ground_start_time is not None:
+                    ground_start_time = None
+                    print(f"[DroneCommander] 📈 Altitude increased to {current_alt:.2f}m - resetting ground timer")
+            
+            time.sleep(0.5)  # Check every 0.5 seconds
+        
+        # Timeout reached
+        print("[DroneCommander] ⏰ Landing monitor timeout - check drone manually")
+        self.commandFeedback.emit("⚠️ Landing monitor timeout - please check drone status")
+        
+     except Exception as e:
+        print(f"[DroneCommander ERROR] Landing monitor failed: {e}")
+        self.commandFeedback.emit(f"Error monitoring landing: {e}")
 
     @pyqtSlot(str, result=bool)
     def setMode(self, mode_name):
-        if not self._is_drone_ready(): 
-            self.commandFeedback.emit("Error: Drone not connected.")
-            self._speak("Error. Drone not connected.")
+     """Set flight mode - NON-BLOCKING version using thread"""
+     if not self._is_drone_ready(): 
+        self.commandFeedback.emit("Error: Drone not connected.")
+        self._speak("Error. Drone not connected.")
+        return False
+
+    # Check if mode change already in progress
+     with self._mode_change_lock:
+        if self._mode_change_in_progress:
+            self.commandFeedback.emit("Mode change already in progress, please wait...")
+            print("[DroneCommander] ⚠️ Mode change already in progress - rejecting request")
             return False
-
-        print(f"\n[DroneCommander] ===== MODE CHANGE REQUEST =====")
-        print(f"[DroneCommander] Requested mode: {mode_name}")
-        print(f"[DroneCommander] Target system: {self._drone.target_system}")
-        print(f"[DroneCommander] Target component: {self._drone.target_component}")
         
-        self._speak(f"Changing mode to {mode_name}.")
+        # Check cooldown period
+        current_time = time.time()
+        time_since_last = current_time - self._last_mode_change_time
+        if time_since_last < self._mode_change_cooldown:
+            remaining = self._mode_change_cooldown - time_since_last
+            self.commandFeedback.emit(f"Please wait {remaining:.1f}s before changing mode again")
+            print(f"[DroneCommander] ⚠️ Mode change cooldown active ({remaining:.1f}s remaining)")
+            return False
         
-        try:
-            mode_id = self._drone.mode_mapping().get(mode_name.upper())
-            if mode_id is None:
-                available_modes = list(self._drone.mode_mapping().keys())
-                self.commandFeedback.emit(f"Error: Unknown mode '{mode_name}'. Available: {available_modes}")
-                self._speak(f"Error. Unknown mode {mode_name}.")
-                print(f"[DroneCommander] Available modes: {available_modes}")
-                return False
+        # Lock mode change
+        self._mode_change_in_progress = True
+        self._last_mode_change_time = current_time
 
-            print(f"[DroneCommander] Mode ID: {mode_id}")
+     print(f"\n[DroneCommander] ===== MODE CHANGE REQUEST =====")
+     print(f"[DroneCommander] Requested mode: {mode_name}")
+    
+    # Get current mode for comparison
+     current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+     print(f"[DroneCommander] Current mode: {current_mode}")
+    
+    # Check if already in requested mode
+     if current_mode == mode_name.upper():
+        self.commandFeedback.emit(f"Already in {mode_name} mode")
+        self._speak(f"Already in {mode_name} mode.")
+        with self._mode_change_lock:
+            self._mode_change_in_progress = False
+        return True
+    
+    # Get mode ID
+     mode_id = self._drone.mode_mapping().get(mode_name.upper())
+     if mode_id is None:
+        available_modes = list(self._drone.mode_mapping().keys())
+        self.commandFeedback.emit(f"Error: Unknown mode '{mode_name}'")
+        self._speak(f"Error. Unknown mode {mode_name}.")
+        with self._mode_change_lock:
+            self._mode_change_in_progress = False
+        return False
+
+    # Start mode change in separate thread (NON-BLOCKING)
+     mode_thread = threading.Thread(
+        target=self._do_mode_change,
+        args=(mode_name, mode_id),
+        daemon=True
+    )
+     mode_thread.start()
+    
+     self.commandFeedback.emit(f"Changing mode to {mode_name}...")
+     self._speak(f"Changing mode to {mode_name}.")
+    
+     return True
+
+    
+    def _do_mode_change(self, mode_name, mode_id):
+     """
+    Internal method that does the actual mode change.
+    Runs in a separate thread to avoid blocking UI.
+    """
+     try:
+        # ⭐ NOTIFY DroneModel that user requested this mode ⭐
+        self.drone_model.notifyModeChangeRequest(mode_name.upper())
+        
+        print(f"[DroneCommander] Mode ID: {mode_id}")
+        print("[DroneCommander] Sending mode change command (non-blocking)...")
+        
+        max_attempts = 3
+        
+        for attempt in range(max_attempts):
+            # Send command
+            self._drone.mav.set_mode_send(
+                self._drone.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id
+            )
+            print(f"[DroneCommander] Sent mode change attempt {attempt + 1}/{max_attempts}")
             
-            print("[DroneCommander] Sending mode change commands...")
-            for i in range(5):
-                self._drone.mav.set_mode_send(
-                    self._drone.target_system,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    mode_id
-                )
-                print(f"[DroneCommander]   Sent attempt {i+1}/5")
-                time.sleep(0.1)
-            
-            self.commandFeedback.emit(f"Mode change to '{mode_name}' sent (waiting for confirmation)")
-            
-            print("[DroneCommander] Monitoring telemetry for mode change...")
+            # Wait for confirmation (shorter timeout per attempt)
+            confirmation_timeout = 2.0
             start_time = time.time()
-            while time.time() - start_time < 3:
+            
+            while time.time() - start_time < confirmation_timeout:
                 current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+                
                 if current_mode == mode_name.upper():
-                    self.commandFeedback.emit(f"Mode changed to '{mode_name}' successfully!")
+                    self.commandFeedback.emit(f"✅ Mode changed to '{mode_name}' successfully!")
                     self._speak(f"Mode changed to {mode_name} successfully.")
-                    print(f"[DroneCommander] Mode change confirmed via telemetry")
-                    return True
-                time.sleep(0.1)
+                    print(f"[DroneCommander] ✅ Mode change confirmed")
+                    return  # Success - exit function
+                
+                time.sleep(0.1)  # Safe because we're in a separate thread
             
-            print("[DroneCommander] Mode change sent, no telemetry confirmation yet")
-            self.commandFeedback.emit(f"Mode change command sent to '{mode_name}'")
-            self._speak(f"Mode change command sent to {mode_name}.")
-            return True
-            
-        except Exception as e:
-            self.commandFeedback.emit(f"Error sending SET_MODE command: {e}")
-            self._speak("Error sending mode change command.")
-            print(f"[DroneCommander ERROR] SET_MODE command failed: {e}")
-            return False
+            # Retry if not last attempt
+            if attempt < max_attempts - 1:
+                print(f"[DroneCommander] ⚠️ Attempt {attempt + 1} timeout, retrying...")
+                time.sleep(0.3)
+        
+        # After all attempts, check one final time
+        final_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+        if final_mode == mode_name.upper():
+            self.commandFeedback.emit(f"✅ Mode changed to '{mode_name}' successfully!")
+            self._speak(f"Mode changed to {mode_name} successfully.")
+            print(f"[DroneCommander] ✅ Mode change confirmed (delayed)")
+        else:
+            self.commandFeedback.emit(f"⚠️ Mode change may have failed (current: {final_mode})")
+            self._speak(f"Mode change to {mode_name} may have failed.")
+            print(f"[DroneCommander] ⚠️ Mode change not confirmed - current: {final_mode}")
+    
+     except Exception as e:
+        self.commandFeedback.emit(f"Error sending mode change: {e}")
+        self._speak("Error sending mode change command.")
+        print(f"[DroneCommander ERROR] {e}")
+    
+     finally:
+        # CRITICAL: Always unlock
+        with self._mode_change_lock:
+            self._mode_change_in_progress = False
+        print("[DroneCommander] Mode change lock released")
+
+# Optional: Emergency unlock method
+    @pyqtSlot(result=bool)  
+    def forceUnlockModeChange(self):
+     """Force unlock mode change (debugging only)"""
+     with self._mode_change_lock:
+        was_locked = self._mode_change_in_progress
+        self._mode_change_in_progress = False
+        self._last_mode_change_time = 0
+    
+     if was_locked:
+        print("[DroneCommander] ⚠️ Force unlocked mode change")
+        self.commandFeedback.emit("Mode change unlocked")
+        return True
+     return False
 
     def _wait_for_command_ack(self, command_id, timeout=5):
         """Helper to wait for command acknowledgment"""
@@ -752,136 +962,537 @@ class DroneCommander(QObject):
             self._speak("Mission upload error.")
             return False
 
+    @pyqtSlot(result=bool)
     def requestAllParameters(self):
-        if not self._is_drone_ready():
-            self.commandFeedback.emit("Error: Drone not connected to request parameters.")
-            self._speak("Error. Drone not connected to request parameters.")
-            return False
+     """Request ALL drone parameters - QUEUE-BASED (NO CONFLICTS)"""
+     if not self._is_drone_ready():
+        self.commandFeedback.emit("Error: Drone not connected to request parameters.")
+        print("[DroneCommander] ❌ Cannot request parameters - drone not connected")
+        return False
     
-        print("[DroneCommander] Requesting all MAVLink parameters...")
-        self.commandFeedback.emit("Requesting all MAVLink parameters...")
-        self._speak("Requesting all MAVLink parameters.")
-        
-        self._parameters = {}
+     if self._fetching_params:
+        print("[DroneCommander] ⚠️ Parameter fetch already in progress")
+        self.commandFeedback.emit("Parameter fetch already in progress...")
+        return False
     
+     print("\n" + "="*60)
+     print("[DroneCommander] ✅ Parameter fetch started (QUEUE MODE)")
+     print("="*60)
+    
+    # Clear previous parameters and queue
+     with self._param_lock:
+        self._parameters.clear()
+    
+    # Clear queue
+     while not self._param_queue.empty():
         try:
+            self._param_queue.get_nowait()
+        except queue.Empty:
+            break
+    
+    # Mark as active
+     self._fetching_params = True
+     self._param_request_active = True
+    
+    # Send parameter request (MAVLinkThread will collect them)
+     print("[DroneCommander] 📤 Sending PARAM_REQUEST_LIST...")
+     for retry in range(3):
+        self._drone.mav.param_request_list_send(
+            self._drone.target_system,
+            self._drone.target_component
+        )
+        time.sleep(0.1)
+    
+    # Start processing thread
+     fetch_thread = threading.Thread(target=self._process_parameter_queue, daemon=True)
+     fetch_thread.start()
+    
+     self.commandFeedback.emit("Requesting parameters from drone...")
+     return True
+    def _process_parameter_queue(self):
+     """Process parameters from queue (collected by MAVLinkThread)"""
+     print("[DroneCommander] 📥 Processing parameter queue...")
+    
+     try:
+        collected_params = {}
+        total_params = None
+        start_time = time.time()
+        last_param_time = time.time()
+        
+        timeout = 60  # 60 seconds total
+        no_data_timeout = 10  # 10 seconds without new data
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Get parameter from queue (non-blocking)
+                param_data = self._param_queue.get(timeout=0.5)
+                
+                if param_data:
+                    last_param_time = time.time()
+                    
+                    param_id = param_data['name']
+                    param_value = param_data['value']
+                    param_type = param_data['type']
+                    param_index = param_data['index']
+                    param_count = param_data['count']
+                    
+                    # Set total on first parameter
+                    if total_params is None:
+                        total_params = param_count
+                        print(f"[DroneCommander] 📊 Total parameters: {total_params}")
+                        self.commandFeedback.emit(f"Loading {total_params} parameters...")
+                    
+                    # Store parameter (avoid duplicates)
+                    if param_id not in collected_params:
+                        collected_params[param_id] = {
+                            "name": param_id,
+                            "value": str(param_value),
+                            "type": "FLOAT" if param_type in [9, 10] else "INT32",
+                            "index": param_index,
+                            "count": param_count,
+                            "synced": True,
+                            "default": "0",
+                            "units": "",
+                            "range": "",
+                            "description": ""
+                        }
+                        
+                        # Progress update every 50 params
+                        if len(collected_params) % 50 == 0:
+                            print(f"[DroneCommander] 📥 Progress: {len(collected_params)}/{total_params}")
+                            self.commandFeedback.emit(f"Received {len(collected_params)} parameters...")
+                    
+                    # Check if complete
+                    if total_params and len(collected_params) >= total_params:
+                        print(f"[DroneCommander] ✅ All {len(collected_params)} parameters received!")
+                        break
+                
+            except queue.Empty:
+                # Check timeout
+                if len(collected_params) > 0:
+                    time_since_last = time.time() - last_param_time
+                    if time_since_last > no_data_timeout:
+                        print(f"[DroneCommander] ⏹️ No new data for {no_data_timeout}s - assuming complete")
+                        break
+                continue
+        
+        # Store results
+        final_count = len(collected_params)
+        print(f"\n[DroneCommander] 📊 Final Results: {final_count} parameters")
+        
+        if final_count > 0:
+            with self._param_lock:
+                self._parameters = collected_params
+            
+            print(f"[DroneCommander] 📤 Emitting parametersUpdated signal...")
+            self.parametersUpdated.emit()
+            self.commandFeedback.emit(f"✅ Loaded {final_count} parameters!")
+        else:
+            print("[DroneCommander] ❌ No parameters received")
+            self.commandFeedback.emit("❌ No parameters received from drone")
+    
+     except Exception as e:
+        print(f"[DroneCommander] ❌ ERROR processing parameters: {e}")
+        import traceback
+        traceback.print_exc()
+        self.commandFeedback.emit(f"Error processing parameters: {e}")
+    
+     finally:
+        self._fetching_params = False
+        self._param_request_active = False
+        print("="*60 + "\n")
+
+    def add_parameter_to_queue(self, param_msg):
+     """
+     Called by MAVLinkThread when it receives a PARAM_VALUE message.
+     Thread-safe parameter collection without blocking main telemetry.
+     """
+     if not self._param_request_active:
+        return  # Ignore parameters if we're not requesting them
+    
+     try:
+        param_id = param_msg.param_id.decode('utf-8').strip('\x00')
+        param_value = float(param_msg.param_value)
+        param_type = int(param_msg.param_type)
+        param_index = int(param_msg.param_index)
+        param_count = int(param_msg.param_count)
+        
+        param_data = {
+            'name': param_id,
+            'value': param_value,
+            'type': param_type,
+            'index': param_index,
+            'count': param_count
+        }
+        
+        # Add to queue (non-blocking)
+        self._param_queue.put(param_data)
+        
+     except Exception as e:
+        print(f"[DroneCommander] ⚠️ Error queuing parameter: {e}")
+
+    def _fetch_parameters_blocking(self):
+     """BLOCKING parameter fetch - dedicated thread with exclusive message access"""
+     print("[DroneCommander] 🔄 REQUESTING PARAMETERS (BLOCKING MODE)")
+    
+     try:
+        # Step 1: Temporarily pause main telemetry thread (if possible)
+        print("[DroneCommander] 📤 Sending PARAM_REQUEST_LIST...")
+        
+        # Send request with retries
+        for retry in range(3):
             self._drone.mav.param_request_list_send(
                 self._drone.target_system,
                 self._drone.target_component
             )
-    
-            start_time = time.time()
-            received_count = 0
-            total_params = -1
-    
-            timeout_per_param = 0.5
-            max_total_timeout = 30
-    
-            while time.time() - start_time < max_total_timeout:
-                msg = self._drone.recv_match(type='PARAM_VALUE', blocking=True, timeout=timeout_per_param)
+            time.sleep(0.2)
+        
+        # Step 2: Dedicated parameter collection
+        print("[DroneCommander] ⏳ Collecting parameters...")
+        
+        collected_params = {}
+        total_params = None
+        start_time = time.time()
+        last_param_time = time.time()
+        no_data_timeout = 8  # 8 seconds without new data
+        overall_timeout = 90  # 90 seconds total
+        
+        consecutive_failures = 0
+        max_consecutive_failures = 50  # Allow 50 empty reads before giving up
+        
+        while time.time() - start_time < overall_timeout:
+            try:
+                # CRITICAL: Use blocking=True with timeout to get exclusive access
+                msg = self._drone.recv_match(
+                    type='PARAM_VALUE', 
+                    blocking=True,  # BLOCKING - this is the key fix
+                    timeout=0.5
+                )
                 
                 if msg:
-                    param_id = msg.param_id.strip()
-                    param_value = msg.param_value
+                    # Reset counters on successful read
+                    consecutive_failures = 0
+                    last_param_time = time.time()
                     
-                    self._parameters[param_id] = {
-                        "name": param_id,
-                        "value": param_value,
-                        "type": msg.param_type,
-                        "index": msg.param_index,
-                        "count": msg.param_count
-                    }
-    
-                    if total_params == -1:
-                        total_params = msg.param_count
-                        print(f"[DroneCommander] Expected {total_params} parameters.")
-    
-                    received_count = msg.param_index + 1
-    
-                    self.commandFeedback.emit(f"Received {received_count}/{total_params}: {param_id} = {param_value}")
+                    # Extract parameter info
+                    param_id = msg.param_id.decode('utf-8').strip('\x00')
+                    param_value = float(msg.param_value)
+                    param_type = int(msg.param_type)
+                    param_index = int(msg.param_index)
+                    param_count = int(msg.param_count)
                     
-                    if total_params != -1 and received_count >= total_params:
-                        print(f"[DroneCommander] All {total_params} parameters received.")
+                    # Set total on first message
+                    if total_params is None:
+                        total_params = param_count
+                        print(f"[DroneCommander] 📊 Total parameters: {total_params}")
+                        self.commandFeedback.emit(f"Loading {total_params} parameters...")
+                    
+                    # Store parameter (avoid duplicates)
+                    if param_id not in collected_params:
+                        collected_params[param_id] = {
+                            "name": param_id,
+                            "value": str(param_value),
+                            "type": "FLOAT" if param_type in [9, 10] else "INT32",
+                            "index": param_index,
+                            "count": param_count,
+                            "synced": True,
+                            "default": "0",
+                            "units": "",
+                            "range": "",
+                            "description": ""
+                        }
+                        
+                        # Progress update every 25 params
+                        if len(collected_params) % 25 == 0:
+                            print(f"[DroneCommander] 📥 Progress: {len(collected_params)}/{total_params if total_params else '?'}")
+                            self.commandFeedback.emit(f"Received {len(collected_params)} parameters...")
+                            if total_params:
+                                self.parameterProgress.emit(len(collected_params), total_params)
+                    
+                    # Check if complete
+                    if total_params and len(collected_params) >= total_params:
+                        print(f"[DroneCommander] ✅ All {len(collected_params)} parameters received!")
                         break
+                
                 else:
-                    if total_params != -1 and received_count > 0:
-                        print(f"[DroneCommander] Finished receiving parameters. Received {received_count}/{total_params} (or timed out waiting for more).")
-                        break
+                    # No message received
+                    consecutive_failures += 1
                     
-            if total_params == -1:
-                self.commandFeedback.emit("Failed to receive any parameters. Drone might not be responding.")
-                self._speak("Failed to receive any parameters.")
-                print("[DroneCommander ERROR] No parameters received.")
-                return False
-            elif received_count < total_params:
-                self.commandFeedback.emit(f"Warning: Only received {received_count}/{total_params} parameters.")
-                self._speak(f"Warning. Only received {received_count} of {total_params} parameters.")
-                print(f"[DroneCommander WARNING] Only received {received_count}/{total_params} parameters.")
-            else:
-                self.commandFeedback.emit(f"Successfully received all {total_params} parameters!")
-                self._speak(f"Successfully received all {total_params} parameters.")
-                print(f"[DroneCommander] Successfully received all {total_params} parameters!")
-    
-            self.parametersUpdated.emit(self._parameters)  
-            return True
-    
-        except Exception as e:
-            msg = f"Error requesting parameters: {e}"
-            self.commandFeedback.emit(msg)
-            self._speak("Error requesting parameters.")
-            print(f"[DroneCommander ERROR] {msg}")
-            return False
-
-    @pyqtProperty('QVariant', notify=parametersUpdated)
-    def parameters(self):
-        print(self._parameters)
-        return self._parameters
-
-    @pyqtSlot(str, float, result=bool)
-    def setParameter(self, param_id, param_value):
-        if not self._is_drone_ready():
-            self.commandFeedback.emit("Error: Drone not connected to set parameters.")
-            self._speak("Error. Drone not connected to set parameters.")
-            return False
+                    # Check if we have some parameters and timed out
+                    if len(collected_params) > 0:
+                        time_since_last = time.time() - last_param_time
+                        if time_since_last > no_data_timeout:
+                            print(f"[DroneCommander] ⏹️ No new data for {no_data_timeout}s - assuming complete")
+                            break
+                    
+                    # Check consecutive failures
+                    if consecutive_failures >= max_consecutive_failures:
+                        if len(collected_params) > 0:
+                            print(f"[DroneCommander] ⚠️ {consecutive_failures} empty reads - assuming complete with {len(collected_params)} params")
+                            break
+                        else:
+                            print(f"[DroneCommander] ❌ No parameters received after {consecutive_failures} attempts")
+                            break
+                
+            except Exception as e:
+                print(f"[DroneCommander] ⚠️ recv_match exception: {e}")
+                consecutive_failures += 1
+                time.sleep(0.1)
+                continue
         
-        print(f"[DroneCommander] Setting parameter '{param_id}' to {param_value}...")
-        self.commandFeedback.emit(f"Setting parameter '{param_id}' to {param_value}...")
-        self._speak(f"Setting parameter {param_id} to {param_value}.")
+        # Step 3: Store results
+        final_count = len(collected_params)
+        print(f"\n[DroneCommander] 📊 Final Results: {final_count} parameters")
+        
+        if final_count > 0:
+            # Update shared storage
+            with self._param_lock:
+                self._parameters = collected_params
+            
+            # Emit to QML
+            print(f"[DroneCommander] 📤 Emitting parametersUpdated signal...")
+            self.parametersUpdated.emit()
+            self.commandFeedback.emit(f"✅ Loaded {final_count} parameters!")
+            print(f"[DroneCommander] ✅ Parameters available to QML")
+        else:
+            print("[DroneCommander] ❌ No parameters received")
+            self.commandFeedback.emit("❌ No parameters received from drone")
+    
+     except Exception as e:
+        print(f"[DroneCommander] ❌ ERROR during parameter fetch: {e}")
+        import traceback
+        traceback.print_exc()
+        self.commandFeedback.emit(f"Error fetching parameters: {e}")
+    
+     finally:
+        self._fetching_params = False
+        print("="*60 + "\n")
+    
+    def _fetch_parameters_improved(self):
+        """Improved parameter fetching with proper error handling"""
+        print("\n" + "="*60)
+        print("[DroneCommander] 🔄 REQUESTING PARAMETERS")
+        print("="*60)
         
         try:
+            with self._param_lock:
+                self._parameters.clear()
+            
+            # Step 1: Send parameter request list
+            print("[DroneCommander] 📤 Sending PARAM_REQUEST_LIST...")
+            self._drone.mav.param_request_list_send(
+                self._drone.target_system,
+                self._drone.target_component
+            )
+            
+            # Step 2: Wait for initial response
+            print("[DroneCommander] ⏳ Waiting for initial response...")
+            start_time = time.time()
+            first_param_received = False
+            
+            while time.time() - start_time < 5:  # 5 second timeout for first param
+                try:
+                    msg = self._drone.recv_match(type='PARAM_VALUE', blocking=False, timeout=0.1)
+                    
+                    if msg:
+                        first_param_received = True
+                        print(f"[DroneCommander] ✅ First parameter received!")
+                        
+                        # Process this first parameter
+                        self._process_param_message(msg)
+                        break
+                    
+                    time.sleep(0.05)
+                except Exception as e:
+                    # Ignore recv_match errors from thread conflicts
+                    time.sleep(0.1)
+                    continue
+            
+            if not first_param_received:
+                print("[DroneCommander] ❌ No response from drone - check connection")
+                self.commandFeedback.emit("❌ No parameter response from drone")
+                self._fetching_params = False
+                return
+            
+            # Step 3: Continue receiving parameters
+            print("[DroneCommander] 📥 Receiving parameters...")
+            
+            total_params = None
+            last_received_time = time.time()
+            no_data_timeout = 5  # 5 seconds without new data = done
+            overall_timeout = 60  # 60 seconds total timeout
+            
+            while time.time() - start_time < overall_timeout:
+                try:
+                    msg = self._drone.recv_match(type='PARAM_VALUE', blocking=False, timeout=0.1)
+                    
+                    if msg:
+                        last_received_time = time.time()
+                        
+                        # Get total param count from first message
+                        if total_params is None:
+                            total_params = msg.param_count
+                            print(f"[DroneCommander] 📊 Total parameters: {total_params}")
+                        
+                        # Process parameter
+                        self._process_param_message(msg)
+                        
+                        # Check if we got all parameters
+                        current_count = len(self._parameters)
+                        if total_params and current_count >= total_params:
+                            print(f"[DroneCommander] ✅ All {current_count} parameters received!")
+                            break
+                        
+                        # Progress logging every 50 params
+                        if current_count % 50 == 0:
+                            print(f"[DroneCommander] 📥 Progress: {current_count} parameters")
+                            self.commandFeedback.emit(f"Received {current_count} parameters...")
+                    
+                    # Check for timeout
+                    if time.time() - last_received_time > no_data_timeout:
+                        current_count = len(self._parameters)
+                        if current_count > 0:
+                            print(f"[DroneCommander] ⏹️ Timeout - received {current_count} parameters")
+                            break
+                    
+                    time.sleep(0.02)
+                    
+                except Exception as e:
+                    # Ignore thread conflict errors
+                    time.sleep(0.05)
+                    continue
+            
+            # Step 4: Finalize and emit results
+            final_count = len(self._parameters)
+            print(f"\n[DroneCommander] 📊 Final Results:")
+            print(f"  ✅ Received: {final_count} parameters")
+            
+            if final_count > 0:
+                # Emit signal to QML (QML will read the property)
+                print(f"[DroneCommander] 📤 Emitting parametersUpdated signal...")
+                self.parametersUpdated.emit()
+                
+                self.commandFeedback.emit(f"✅ Loaded {final_count} parameters!")
+                print(f"[DroneCommander] ✅ Parameters emitted to QML")
+            else:
+                print("[DroneCommander] ❌ No parameters received")
+                self.commandFeedback.emit("❌ No parameters received from drone")
+        
+        except Exception as e:
+            print(f"[DroneCommander] ❌ ERROR during parameter fetch: {e}")
+            import traceback
+            traceback.print_exc()
+            self.commandFeedback.emit(f"Error fetching parameters: {e}")
+        
+        finally:
+            self._fetching_params = False
+            print("="*60 + "\n")
+    
+    def _process_param_message(self, msg):
+        """Process a single PARAM_VALUE message"""
+        try:
+            param_id = msg.param_id.decode('utf-8').strip('\x00')
+            param_value = float(msg.param_value)  # Always convert to float
+            param_type = int(msg.param_type)
+            param_index = int(msg.param_index)
+            param_count = int(msg.param_count)
+            
+            # Don't add duplicates
+            if param_id not in self._parameters:
+                with self._param_lock:
+                    self._parameters[param_id] = {
+                        "name": param_id,
+                        "value": str(param_value),  # Convert to string for QML
+                        "type": "FLOAT" if param_type in [9, 10] else "INT32",
+                        "index": param_index,
+                        "count": param_count,
+                        "synced": True,
+                        "default": "0",
+                        "units": "",
+                        "range": "",
+                        "description": ""
+                    }
+                
+                # Emit individual parameter update
+                self.parameterReceived.emit(param_id, param_value)
+        
+        except Exception as e:
+            print(f"[DroneCommander] ⚠️ Error processing parameter: {e}")
+    
+    @pyqtProperty('QVariant', notify=parametersUpdated)
+    def parameters(self):
+     """Return parameters as QVariant (dictionary) for QML"""
+     with self._param_lock:
+        result = dict(self._parameters)
+    
+     print(f"[DroneCommander] 📤 Returning {len(result)} parameters to QML")
+     return result
+    
+    @pyqtSlot(str, float, result=bool)
+    def setParameter(self, param_id, param_value):
+        """Set a single parameter on the drone"""
+        if not self._is_drone_ready():
+            self.commandFeedback.emit("Error: Drone not connected.")
+            return False
+        
+        print(f"[DroneCommander] 📝 Setting parameter '{param_id}' to {param_value}")
+        self.commandFeedback.emit(f"Setting '{param_id}' to {param_value}...")
+        
+        try:
+            # Convert param_id to bytes
+            param_id_bytes = param_id.encode('utf-8')
+            
+            # Determine parameter type
+            param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            if param_id in self._parameters:
+                stored_type = self._parameters[param_id].get('type', 'FLOAT')
+                if stored_type == 'INT32':
+                    param_type = mavutil.mavlink.MAV_PARAM_TYPE_INT32
+                    param_value = int(param_value)
+            
+            # Send parameter set command
             self._drone.mav.param_set_send(
                 self._drone.target_system,
                 self._drone.target_component,
-                param_id.encode('utf-8'),
+                param_id_bytes,
                 param_value,
-                mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                param_type
             )
             
+            # Wait for acknowledgment
             start_time = time.time()
-            ack_timeout = 5
-            while time.time() - start_time < ack_timeout:
-                msg = self._drone.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.1)
-                if msg and msg.param_id.decode().strip() == param_id:
-                    if msg.param_value == param_value:
-                        self.commandFeedback.emit(f"Parameter '{param_id}' set successfully to {msg.param_value}")
-                        self._speak(f"Parameter {param_id} set successfully.")
-                        self._parameters[param_id] = msg.param_value
-                        self.parametersUpdated.emit(self._parameters.copy())
-                        return True
-                    else:
-                        self.commandFeedback.emit(f"Parameter '{param_id}' set, but value mismatch (expected {param_value}, got {msg.param_value}).")
-                        self._speak(f"Parameter {param_id} set, but value mismatch.")
-                        self._parameters[param_id] = msg.param_value
-                        self.parametersUpdated.emit(self._parameters.copy())
-                        return False
+            timeout = 3
             
-            self.commandFeedback.emit(f"Failed to get confirmation for parameter '{param_id}' set within timeout.")
-            self._speak("Failed to get parameter confirmation.")
+            while time.time() - start_time < timeout:
+                msg = self._drone.recv_match(type='PARAM_VALUE', blocking=False, timeout=0.1)
+                
+                if msg:
+                    received_id = msg.param_id.decode('utf-8').strip('\x00')
+                    if received_id == param_id:
+                        received_value = float(msg.param_value)
+                        
+                        # Update local cache
+                        with self._param_lock:
+                            if param_id in self._parameters:
+                                self._parameters[param_id]['value'] = str(received_value)
+                        
+                        # Check if value matches
+                        if abs(received_value - param_value) < 0.001:
+                            self.commandFeedback.emit(f"✅ Parameter '{param_id}' set to {received_value}")
+                            self.parametersUpdated.emit()
+                            return True
+                        else:
+                            self.commandFeedback.emit(f"⚠️ Value mismatch: expected {param_value}, got {received_value}")
+                            self.parametersUpdated.emit()
+                            return False
+                
+                time.sleep(0.05)
+            
+            self.commandFeedback.emit(f"⏱️ Timeout setting parameter '{param_id}'")
             return False
-            
+        
         except Exception as e:
-            msg = f"Error setting parameter '{param_id}': {e}"
-            self.commandFeedback.emit(msg)
-            self._speak(f"Error setting parameter {param_id}.")
-            print(f"[DroneCommander ERROR] {msg}")
+            error_msg = f"Error setting parameter: {e}"
+            print(f"[DroneCommander] ❌ {error_msg}")
+            self.commandFeedback.emit(error_msg)
             return False
