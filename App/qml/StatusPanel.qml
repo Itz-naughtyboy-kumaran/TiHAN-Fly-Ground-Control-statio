@@ -18,12 +18,13 @@ Rectangle {
         GradientStop { position: 1.0; color: "#d5d5d5" }
     }
 
-    // Professional data binding properties
-    property real altitude: 0.0
-    property real groundSpeed: 2.22
-    property real yaw: 153.09
-    property real vibration: 0.0
-    property real epk: 0.0
+    // Properties to receive values from Main.qml
+    property real altitude: 0
+    property real groundSpeed: 0
+    property real yaw: 0
+    property real vibration: 0
+    property real efk: 0
+    
     property var languageManager: null
 
     Column {
@@ -61,7 +62,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: altitude.toFixed(1)
+                    text: root.altitude.toFixed(1)
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
@@ -97,7 +98,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: groundSpeed.toFixed(2)
+                    text: root.groundSpeed.toFixed(2)
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
@@ -139,7 +140,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: yaw.toFixed(2)
+                    text: root.yaw.toFixed(2)
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
@@ -175,7 +176,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: vibration.toFixed(2)
+                    text: root.vibration.toFixed(2)
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
@@ -187,7 +188,7 @@ Rectangle {
             }
         }
 
-        // Third row - EPK (full width)
+        // Third row - EFK (full width)
         Row {
             width: parent.width
             spacing: 3
@@ -207,7 +208,7 @@ Rectangle {
                     spacing: 5
 
                     Text {
-                        text: (languageManager ? languageManager.getText("EPK") : "EPK")
+                        text: (languageManager ? languageManager.getText("EFK") : "EFK")
                         color: "#ff0000"
                         font.pixelSize: 14
                         font.family: "Consolas"
@@ -217,7 +218,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: epk.toFixed(2)
+                    text: root.efk.toFixed(2)
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
@@ -229,7 +230,7 @@ Rectangle {
             }
         }
         
-        //4th row for flight mode
+        // Fourth row - Flight Mode (full width)
         Row {
             width: parent.width
             spacing: 3
@@ -259,7 +260,7 @@ Rectangle {
                 }
 
                 Text {
-                    text: droneModel.telemetry.mode
+                    text: droneModel.telemetry.mode ? droneModel.telemetry.mode : "UNKNOWN"
                     color: "black"
                     font.pixelSize: 14
                     font.family: "Consolas"
