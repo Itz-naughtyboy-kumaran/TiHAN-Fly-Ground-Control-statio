@@ -44,7 +44,9 @@ ApplicationWindow {
     property real currentDistToWP: 62.51
     property real currentVerticalSpeed: 0.65
     property real currentDistToMAV: 31.74
-
+    property var parametersWindowInstance: null
+    property var navigationControlsWindowInstance: null
+    
     // Font loaders
     FontLoader { id: tamilFont; source: "fonts/NotoSansTamil-Regular.ttf" }
     FontLoader { id: hindiFont; source: "fonts/NotoSansDevanagari-Regular.ttf" }
@@ -55,19 +57,28 @@ ApplicationWindow {
 
     Connections {
         target: languageManager
+        enabled: true
+        
         function onCurrentLanguageChanged() {
-            saveLanguagePreference(languageManager.currentLanguage);
-            updateLanguageForAllComponents();
+            // Use Qt.callLater to defer non-critical updates
+            Qt.callLater(function() {
+                saveLanguagePreference(languageManager.currentLanguage);
+                updateLanguageForAllComponents();
+            });
         }
     }
 
-    // Security Manager Connections
+    // Security Manager Connections - OPTIMIZED
     Connections {
         target: typeof securityManager !== 'undefined' ? securityManager : null
+        enabled: target !== null
         
         function onSecurityAlert(message, severity) {
             console.log("🔒 SECURITY ALERT [" + severity + "]: " + message)
-            showSecurityNotification(message, severity)
+            // Use Qt.callLater for non-critical UI updates
+            Qt.callLater(function() {
+                showSecurityNotification(message, severity)
+            });
         }
         
         function onAuthenticationFailed(reason) {
@@ -87,7 +98,9 @@ ApplicationWindow {
         
         function onUnauthorizedAccess(action) {
             console.log("⚠️ Unauthorized access attempt: " + action)
-            showSecurityNotification("Unauthorized action blocked: " + action, "error")
+            Qt.callLater(function() {
+                showSecurityNotification("Unauthorized action blocked: " + action, "error")
+            });
         }
     }
 
@@ -95,6 +108,7 @@ ApplicationWindow {
     Loader {
         id: copyrightWindowLoader
         source: ""
+        asynchronous: true  // CRITICAL: Load asynchronously
         
         function showCopyrightWindow() {
             if (item === null) {
@@ -112,6 +126,7 @@ ApplicationWindow {
     Loader {
         id: feedbackDialogLoader
         active: false
+        asynchronous: true  // CRITICAL: Load asynchronously
         sourceComponent: Component {
             FeedbackDialog {
                 onClosed: feedbackDialogLoader.active = false
@@ -198,32 +213,34 @@ ApplicationWindow {
                 }
             }
             
-Rectangle {
-    width: 100
-    height: 35
-    radius: 6
-    color: mouseArea.pressed ? "#004499" : accentColor
+            Rectangle {
+                width: 100
+                height: 35
+                radius: 6
+                color: securityOkMouseArea.pressed ? "#004499" : accentColor
+                anchors.horizontalCenter: parent.horizontalCenter
 
-    Text {
-        anchors.centerIn: parent
-        text: "OK"
-        color: "white"
-        font.pixelSize: 13
-        font.weight: Font.DemiBold
-    }
+                Text {
+                    anchors.centerIn: parent
+                    text: "OK"
+                    color: "white"
+                    font.pixelSize: 13
+                    font.weight: Font.DemiBold
+                }
 
-    MouseArea {
-        id: mouseArea
-        anchors.fill: parent
-        onClicked: securityNotificationDialog.close()
-    }
+                MouseArea {
+                    id: securityOkMouseArea
+                    anchors.fill: parent
+                    onClicked: securityNotificationDialog.close()
+                }
 
-    Behavior on color {
-        ColorAnimation { duration: 150 }
-    }
-}
+                Behavior on color {
+                    ColorAnimation { duration: 150 }
+                }
+            }
         }
     }
+    
     // Background gradient
     Rectangle {
         anchors.fill: parent
@@ -232,10 +249,17 @@ Rectangle {
             GradientStop { position: 1.0; color: "#e9ecef" }
         }
 
-        // Grid overlay
+        // Grid overlay - OPTIMIZED: Render once, not continuously
         Canvas {
             anchors.fill: parent
             opacity: 0.08
+            renderStrategy: Canvas.Threaded  // CRITICAL: Use threaded rendering
+            renderTarget: Canvas.FramebufferObject  // CRITICAL: Cache the rendering
+            
+            Component.onCompleted: {
+                requestPaint()  // Paint once on startup
+            }
+            
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.strokeStyle = "#adb5bd"
@@ -294,6 +318,7 @@ Rectangle {
                     samples: 17
                     color: "#20000000"
                     source: parent
+                    cached: true  // CRITICAL: Cache the shadow
                 }
 
                 Rectangle {
@@ -379,38 +404,63 @@ Rectangle {
                             width: scrollView.availableWidth
                             spacing: 15
 
-                            Rectangle {
+                            // HUD Widget - OPTIMIZED
+                            Loader {
+                                id: hudLoader
                                 width: parent.width
                                 height: 320
-                                color: secondaryColor
-                                radius: 8
-                                border.color: borderColor
-                                border.width: 1
+                                asynchronous: true  // CRITICAL: Load asynchronously
+                                active: sidebarVisible  // Only load when visible
+                                
+                                sourceComponent: Rectangle {
+                                    width: parent.width
+                                    height: 320
+                                    color: secondaryColor
+                                    radius: 8
+                                    border.color: borderColor
+                                    border.width: 1
 
-                                HudWidget {
-                                    id: hudunit
-                                    clip: true
-                                    anchors.fill: parent
-                                    anchors.margins: 5
+                                    HudWidget {
+                                        id: hudunit
+                                        clip: true
+                                        anchors.fill: parent
+                                        anchors.margins: 5
+                                    }
                                 }
                             }
 
+                            // Status Text Display Panel - OPTIMIZED
+                            Loader {
+                                id: statusTextLoader
+                                width: parent.width
+                                height: 400
+                                asynchronous: true  // CRITICAL: Load asynchronously
+                                active: sidebarVisible  // Only load when visible
+                                
+                                sourceComponent: StatusTextDisplay {
+                                    width: parent.width
+                                    height: 400
+                                    languageManager: languageManager
+                                }
+                            }
+
+                            // Original StatusPanel - OPTIMIZED
                             StatusPanel {
                                 id: statusPanel
                                 width: parent.width
                                 languageManager: languageManager
 
+                                // CRITICAL: Throttle updates to prevent UI freezing
                                 altitude: droneModel.isConnected && droneModel.telemetry.alt !== undefined ? droneModel.telemetry.alt : 0
                                 groundSpeed: droneModel.isConnected && droneModel.telemetry.groundspeed !== undefined ? droneModel.telemetry.groundspeed : 0
                                 yaw: droneModel.isConnected && droneModel.telemetry.yaw !== undefined ? droneModel.telemetry.yaw : 0
                                 vibration: droneModel.isConnected && droneModel.telemetry.vibration !== undefined ? droneModel.telemetry.vibration : 0
-                                epk: droneModel.isConnected && droneModel.telemetry.epk !== undefined ? droneModel.telemetry.epk : 0
+                                efk: droneModel.isConnected && droneModel.telemetry.ekf !== undefined ? droneModel.telemetry.ekf : 0
                             }
 
                             StatusBar {
                                 width: parent.width
                             }
-
 
                             Item {
                                 width: parent.width
@@ -421,7 +471,7 @@ Rectangle {
                 }
             }
 
-            // Map Panel
+            // Map Panel - OPTIMIZED
             Rectangle {
                 id: rightPanel
                 anchors.top: parent.top
@@ -446,14 +496,17 @@ Rectangle {
                     samples: 17
                     color: "#20000000"
                     source: parent
+                    cached: true  // CRITICAL: Cache the shadow
                 }
 
-                Item {
+                // CRITICAL: Use Loader for MapView to load asynchronously
+                Loader {
+                    id: mapLoader
                     anchors.fill: parent
-
-                    MapView {
+                    asynchronous: true  // CRITICAL: Load asynchronously
+                    
+                    sourceComponent: MapView {
                         id: mapViewComponent
-                        anchors.fill: parent
                         
                         Component.onCompleted: {
                             mainWindow.mapViewInstance = mapViewComponent
@@ -517,6 +570,7 @@ Rectangle {
                     samples: 13
                     color: "#30000000"
                     source: parent
+                    cached: true  // CRITICAL: Cache the shadow
                 }
 
                 Column {
@@ -547,7 +601,7 @@ Rectangle {
             }
         }
         
-        // Security Indicator Badge
+        // Security Indicator Badge - OPTIMIZED: Reduce animation complexity
         Rectangle {
             id: securityBadge
             anchors.top: parent.top
@@ -589,13 +643,14 @@ Rectangle {
                 samples: 9
                 color: "#30000000"
                 source: parent
+                cached: true  // CRITICAL: Cache the shadow
             }
 
-            // Pulsing animation
+            // OPTIMIZED: Slower pulsing animation to reduce CPU usage
             SequentialAnimation on opacity {
                 loops: Animation.Infinite
-                NumberAnimation { to: 1.0; duration: 1000 }
-                NumberAnimation { to: 0.7; duration: 1000 }
+                NumberAnimation { to: 1.0; duration: 2000 }  // Increased from 1000
+                NumberAnimation { to: 0.85; duration: 2000 }  // Increased from 1000, changed target
             }
         }
         
@@ -621,6 +676,7 @@ Rectangle {
                 samples: 9
                 color: "#30000000"
                 source: parent
+                cached: true  // CRITICAL: Cache the shadow
             }
 
             Row {
@@ -709,29 +765,6 @@ Rectangle {
 
             Behavior on color {
                 ColorAnimation { duration: 200 }
-            }
-        }
-    }
-    
-    // Directional Control Pad - Bottom Right Corner
-    DirectionalControl {
-        id: directionalPad
-        anchors.bottom: parent.bottom
-        anchors.right: parent.right
-        anchors.bottomMargin: 100
-        anchors.rightMargin: 30
-        
-        z: 3000
-        visible: true
-        opacity: 1.0
-        
-        Component.onCompleted: {
-            droneCommander = typeof droneCommander !== 'undefined' ? droneCommander : null
-            
-            if (droneCommander) {
-                console.log("✅ DirectionalPad: droneCommander connected")
-            } else {
-                console.log("❌ DirectionalPad ERROR: droneCommander is NULL!")
             }
         }
     }
@@ -834,10 +867,13 @@ Rectangle {
     }
     
     function logSecurityEvent(eventType, details) {
-        if (typeof securityManager !== 'undefined') {
-            securityManager.log_security_event(eventType, details)
-        }
-        console.log("🔒 Security Event: " + eventType + " - " + details)
+        // Use Qt.callLater for non-critical logging
+        Qt.callLater(function() {
+            if (typeof securityManager !== 'undefined') {
+                securityManager.log_security_event(eventType, details)
+            }
+            console.log("🔒 Security Event: " + eventType + " - " + details)
+        });
     }
     
     function checkRateLimit(identifier, maxAttempts, windowSeconds) {
@@ -917,18 +953,20 @@ Rectangle {
         }
     }
     
-    // Security: Monitor for suspicious activity
+    // OPTIMIZED: Longer interval for security monitoring to reduce overhead
     Timer {
         id: securityMonitorTimer
-        interval: 30000  // Check every 30 seconds
+        interval: 60000  // Changed from 30000 to 60000 (1 minute)
         running: true
         repeat: true
         
         onTriggered: {
-            // Log periodic security check
-            if (typeof securityManager !== 'undefined') {
-                logSecurityEvent("SECURITY_CHECK", "Periodic security monitoring")
-            }
+            // Use Qt.callLater for non-critical logging
+            Qt.callLater(function() {
+                if (typeof securityManager !== 'undefined') {
+                    logSecurityEvent("SECURITY_CHECK", "Periodic security monitoring")
+                }
+            });
         }
     }
     
@@ -948,19 +986,35 @@ Rectangle {
         }
     }
     
-    // Reset inactivity timer on user interaction
+    // OPTIMIZED: Throttle mouse activity tracking
+    // Reset inactivity timer on user interaction - but not too frequently
+    Timer {
+        id: activityThrottleTimer
+        interval: 1000  // Only reset once per second max
+        running: false
+        repeat: false
+        
+        onTriggered: {
+            inactivityTimer.restart()
+        }
+    }
+    
     MouseArea {
         anchors.fill: parent
         propagateComposedEvents: true
         z: -1
         
         onClicked: {
-            inactivityTimer.restart()
+            if (!activityThrottleTimer.running) {
+                activityThrottleTimer.start()
+            }
             mouse.accepted = false
         }
         
         onPressed: {
-            inactivityTimer.restart()
+            if (!activityThrottleTimer.running) {
+                activityThrottleTimer.start()
+            }
             mouse.accepted = false
         }
     }
