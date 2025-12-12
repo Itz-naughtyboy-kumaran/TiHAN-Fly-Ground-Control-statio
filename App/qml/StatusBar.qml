@@ -3,147 +3,108 @@ import QtQuick.Controls 2.15
 import QtQuick.Dialogs 1.3
 
 Row {
-    id: droneControlRow
+    id: statusBarRoot
     spacing: 10
     property bool isArmed: droneModel.telemetry.armed
     
-    // Add reference to language manager - UPDATE THIS PATH TO MATCH YOUR SETUP
-    property var languageManager: root.languageManager // Make sure this path is correct in your app
+    // Add properties that were referenced as root.xxx
+    property bool isConnected: droneModel.isConnected
+    property int standardFontSize: 14
+    property string standardFontFamily: "Arial"
+    property int standardFontWeight: Font.Normal
     
-    // Debug: Check if languageManager is accessible
-    Component.onCompleted: {
-        console.log("LanguageManager available:", languageManager !== null)
-        console.log("Current language:", languageManager ? languageManager.currentLanguage : "N/A")
-    }
+    MessageDialog { id: modeChangeDialog; title: "Mode Changed"; standardButtons: StandardButton.Ok }
+    MessageDialog{ id: armError; title: "ERROR"}
+    MessageDialog {id: armSuccess; title: "Message" }
     
-    // Signal to notify when language changes so UI can update
-    Connections {
-        target: languageManager
-        function onCurrentLanguageChanged() {
-            // Force update of all text elements
-            modeComboBox.modelChanged()
-        }
-    }
+    // Track if we're currently changing mode to prevent loops
+    property bool isChangingMode: false
     
-    MessageDialog { 
-        id: modeChangeDialog
-        title: languageManager ? languageManager.getText("Mode Changed") : "Mode Changed"
-        standardButtons: StandardButton.Ok 
-    }
-    MessageDialog{ 
-        id: armError
-        title: languageManager ? languageManager.getText("ERROR") : "ERROR"
-    }
-    MessageDialog {
-        id: armSuccess
-        title: languageManager ? languageManager.getText("Message") : "Message"
-    }
-    
-    // Status check timer
+    //status time
     Timer {
         id: statusCheckTimer
         interval: 2000 // Wait for 2 seconds
-        // onTriggered: {
-        //     isArmed = droneModel.telemetry.armed // Update armed status after delay
-        // }
     }
     
-    // ARM/DISARM Button
     Button {
-        id: armDisarmButton
         width: 150; height: 40
-        
-        background: Rectangle { 
-            color: parent.parent.isArmed ? "#4CAF50" : "#F44336"
-            radius: 8 
-        }
-        
-        Label { 
-            anchors.centerIn: parent
-            text: {
-                if (parent.parent.isArmed) {
-                    return languageManager ? languageManager.getText("ARMED") : "ARMED"
-                } else {
-                    return languageManager ? languageManager.getText("DISARMED") : "DISARMED"
-                }
-            }
-            color: "white"
-            font.bold: true 
-        }
-        
+        background: Rectangle { color: parent.parent.isArmed ? "#4CAF50" : "#F44336"; radius: 8 }
+        Label { anchors.centerIn: parent; text: parent.parent.isArmed ? "ARMED" : "DISARMED"; color: "white"; font.bold: true }
         onClicked: {
-            if(droneControlRow.isArmed) {
-                // Disarm the drone
+            if(parent.isArmed){
                 if(droneCommander.disarm()){
                     statusCheckTimer.start()
                     if(!droneModel.telemetry.armed){
                         armError.open()
-                        armError.text = droneModel.statusTexts.length > 0 ? droneModel.statusTexts[droneModel.statusTexts.length - 1] : "Disarm failed"
-                        droneControlRow.isArmed = droneModel.telemetry.armed
+                        armError.text = droneModel.statusTexts[-1]
+                        parent.isArmed = droneModel.telemetry.armed
                     }
-                } else {
+                }else{
                     armSuccess.open()
-                    armSuccess.text = languageManager ? 
-                        languageManager.getText("Drone Disarmed Successfully") : 
-                        "Drone Disarmed Successfully"
-                    droneControlRow.isArmed = droneModel.telemetry.armed
+                    armSuccess.text = "Drone Disarmed Successfully"
+                    parent.isArmed = droneModel.telemetry.armed
                 }
+
             } else {
-                // Arm the drone
                 if(droneCommander.arm()){
                     statusCheckTimer.start()
                     if(droneModel.telemetry.armed){
-                        armSuccess.open()
-                        armSuccess.text = languageManager ? 
-                            languageManager.getText("Drone Armed Successfully") : 
-                            "Drone Armed Successfully"
-                        droneControlRow.isArmed = droneModel.telemetry.armed
-                    } else {
                         armError.open()
-                        armError.text = droneModel.statusTexts.length > 0 ? droneModel.statusTexts[droneModel.statusTexts.length - 1] : "Arm failed"
-                        droneControlRow.isArmed = droneModel.telemetry.armed
+                        armError.text = "Drone Armed Successfully"
+                        parent.isArmed = droneModel.telemetry.armed
+                    }else{
+                        armSuccess.open()
+                        armSuccess.text = droneModel.statusTexts[-1]
+                        parent.isArmed = droneModel.telemetry.armed
                     }
                 }
             }
         }
     }
 
-    // Flight Mode ComboBox
     ComboBox {
         id: modeComboBox
         width: 200
         height: 40
-        
-        // Original English mode keys for drone commander
-        property var modeKeys: [
-            "STABILIZE", "ACRO", "ALT_HOLD", "AUTO", "GUIDED", "LOITER", "RTL", "CIRCLE", 
-            "POSITION", "LAND", "OF_LOITER", "DRIFT", "SPORT", "FLIP", "AUTOTUNE", 
-            "POSHOLD", "BRAKE", "THROW", "AVOID_ADSB", "GUIDED_NOGPS", "SMART_RTL", 
-            "FLOWHOLD", "FOLLOW", "ZIGZAG", "SYSTEMID", "AUTOROTATE", "AUTO_RTL"
+        model: [
+            "STABILIZE", "ACRO", "ALT_HOLD", "AUTO", "GUIDED", "LOITER", "RTL", "CIRCLE", "POSITION", "LAND",
+            "OF_LOITER", "DRIFT", "SPORT", "FLIP", "AUTOTUNE", "POSHOLD", "BRAKE", "THROW", "AVOID_ADSB",
+            "GUIDED_NOGPS", "SMART_RTL", "FLOWHOLD", "FOLLOW", "ZIGZAG", "SYSTEMID", "AUTOROTATE", "AUTO_RTL"
         ]
+        displayText: "Mode: " + currentText
+        enabled: statusBarRoot.isConnected
         
-        // Create display model with translations - with forced update
-        model: {
-            if (!languageManager) {
-                return modeKeys
-            }
-            // Force dependency on current language to trigger updates
-            var currentLang = languageManager.currentLanguage
-            var translatedModes = []
-            for (var i = 0; i < modeKeys.length; i++) {
-                translatedModes.push(languageManager.getText(modeKeys[i]))
-            }
-            return translatedModes
-        }
-        
-        displayText: {
-            var modeLabel = languageManager ? languageManager.getText("Flightmode") : "Mode"
-            return modeLabel + ": " + currentText
-        }
-        
-        enabled: root.isConnected  // Assuming same enable condition as calibration selector
+        // Track last user selection to prevent loops
+        property string lastUserSelectedMode: ""
+        property bool updatingFromDrone: false
 
-        // Background styling
+        // Update the ComboBox when drone mode changes (but don't trigger command)
+        Connections {
+            target: droneModel
+            function onTelemetryChanged() {
+                var droneMode = droneModel.telemetry.mode
+                var index = modeComboBox.model.indexOf(droneMode)
+                
+                if (index !== -1 && index !== modeComboBox.currentIndex) {
+                    console.log("QML: Drone mode changed to:", droneMode, "- Updating ComboBox")
+                    modeComboBox.updatingFromDrone = true
+                    modeComboBox.currentIndex = index
+                    modeComboBox.updatingFromDrone = false
+                }
+            }
+        }
+        
+        // Initialize ComboBox with current drone mode on connection
+        Component.onCompleted: {
+            if (statusBarRoot.isConnected) {
+                var droneMode = droneModel.telemetry.mode
+                var index = modeComboBox.model.indexOf(droneMode)
+                if (index !== -1) {
+                    modeComboBox.currentIndex = index
+                }
+            }
+        }
+
         background: Rectangle {
             radius: 10
             border.width: 2
@@ -164,12 +125,11 @@ Row {
             }
         }
 
-        // Content text styling
         contentItem: Text {
             text: modeComboBox.displayText
-            font.pixelSize: root.standardFontSize || 12
-            font.family: root.standardFontFamily || "Arial"
-            font.weight: root.standardFontWeight || Font.Normal
+            font.pixelSize: statusBarRoot.standardFontSize
+            font.family: statusBarRoot.standardFontFamily
+            font.weight: statusBarRoot.standardFontWeight
             color: enabled ? "#2c5282" : "#6c757d"
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -178,13 +138,12 @@ Row {
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             anchors.leftMargin: 10
-            anchors.rightMargin: 30 // Leave space for dropdown arrow
+            anchors.rightMargin: 30
             anchors.topMargin: 5
             anchors.bottomMargin: 5
             elide: Text.ElideRight
         }
 
-        // Dropdown arrow
         indicator: Canvas {
             x: modeComboBox.width - 18
             y: (modeComboBox.height - height) / 2
@@ -202,11 +161,10 @@ Row {
             }
         }
 
-        // Popup styling
         popup: Popup {
             y: modeComboBox.height + 2
             width: modeComboBox.width
-            height: Math.min(contentItem.implicitHeight, 300) // Limit max height
+            height: contentItem.implicitHeight
             padding: 2
             margins: 0
             
@@ -227,7 +185,6 @@ Row {
             }
         }
 
-        // Delegate styling
         delegate: ItemDelegate {
             width: modeComboBox.width
             height: 35
@@ -240,9 +197,9 @@ Row {
             contentItem: Text {
                 text: modelData
                 color: parent.hovered ? "#ffffff" : "#000000"
-                font.pixelSize: root.standardFontSize || 12
-                font.family: root.standardFontFamily || "Arial"
-                font.weight: root.standardFontWeight || Font.Normal
+                font.pixelSize: statusBarRoot.standardFontSize
+                font.family: statusBarRoot.standardFontFamily
+                font.weight: statusBarRoot.standardFontWeight
                 verticalAlignment: Text.AlignVCenter
                 horizontalAlignment: Text.AlignHCenter
                 renderType: Text.NativeRendering
@@ -250,35 +207,53 @@ Row {
         }
 
         onActivated: {
-            var selectedModeKey = modeKeys[currentIndex] // Get the original mode key
-            var translatedModeName = languageManager ? 
-                languageManager.getText(selectedModeKey) : selectedModeKey
+            // CRITICAL: Only send command when user manually selects AND it's different from current
+            if (modeComboBox.updatingFromDrone) {
+                console.log("QML: Ignoring mode change - updating from drone telemetry")
+                return
+            }
             
-            var changeText = languageManager ? languageManager.getText("Mode changed to") : "Mode changed to"
-            modeChangeDialog.text = changeText + ": " + translatedModeName
-            modeChangeDialog.open()
+            var selectedMode = model[currentIndex]
+            var currentDroneMode = droneModel.telemetry.mode
             
-            // Send the original English mode key to the drone commander
-            droneCommander.setMode(selectedModeKey)
+            // Don't send if already in this mode
+            if (selectedMode === currentDroneMode) {
+                console.log("QML: Already in mode", selectedMode, "- not sending command")
+                return
+            }
+            
+            // Don't send if this was the last mode we tried to set
+            if (selectedMode === modeComboBox.lastUserSelectedMode) {
+                console.log("QML: This mode was already requested recently - not sending again")
+                return
+            }
+            
+            console.log("QML: User manually selected mode:", selectedMode)
+            modeComboBox.lastUserSelectedMode = selectedMode
+            
+            // Send the mode change command
+            if (droneCommander.setMode(selectedMode)) {
+                modeChangeDialog.text = "Mode change command sent: " + selectedMode + "\n\nNote: If mode reverts, your RC transmitter may be overriding it."
+                modeChangeDialog.open()
+            } else {
+                modeChangeDialog.text = "Failed to send mode change to: " + selectedMode
+                modeChangeDialog.open()
+            }
+        }
+        
+        // Clear the last user selection after 5 seconds to allow retry
+        Timer {
+            id: modeRetryTimer
+            interval: 5000
+            onTriggered: {
+                console.log("QML: Clearing last mode selection - user can retry")
+                modeComboBox.lastUserSelectedMode = ""
+            }
         }
 
-        // Tooltip
         ToolTip.visible: hovered
-        ToolTip.text: {
-            if (root.isConnected) {
-                return languageManager ? languageManager.getText("Select flight mode") : "Select flight mode"
-            } else {
-                return languageManager ? languageManager.getText("Connect to drone first") : "Connect to drone first"
-            }
-        }
+        ToolTip.text: statusBarRoot.isConnected ? "Select flight mode" : "Connect to drone first"
         ToolTip.delay: 1000
-        
-        // Update display text when language changes
-        Connections {
-            target: languageManager
-            function onCurrentLanguageChanged() {
-                modeComboBox.displayTextChanged()
-            }
-        }
     }
+
 }
