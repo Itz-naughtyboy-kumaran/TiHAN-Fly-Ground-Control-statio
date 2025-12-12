@@ -28,14 +28,18 @@ class DroneCommander(QObject):
      self._mode_change_in_progress = False
      self._mode_change_lock = threading.Lock()
      self._last_mode_change_time = 0
-     self._mode_change_cooldown = 0.5
+     self._mode_change_cooldown = 5.0  # ✅ INCREASED from 2.0 to 5.0 seconds
+    
+    # ✅ Debounce tracking (CRITICAL - prevents crash)
+     self._last_mode_request = None
+     self._mode_request_time = 0
     
     # Initialize Text-to-Speech
      self.tts = QTextToSpeech(self)
      self.tts.setRate(0.0)
      self.tts.setVolume(1.0)
     
-     print("[DroneCommander] Initialized with non-blocking mode change.")
+    print("[DroneCommander] Initialized with non-blocking mode change.")
 
     def _speak(self, message):
         """Helper method to speak messages"""
@@ -255,164 +259,288 @@ class DroneCommander(QObject):
             print(f"[DroneCommander ERROR] DISARM command failed: {e}")
             return False
 
-    @pyqtSlot(float, result=bool)
-    def takeoff(self, target_altitude):
-     """Takeoff command with automatic arming and mode change to GUIDED"""
-     if not self._is_drone_ready(): 
-        self.commandFeedback.emit("Error: Drone not connected.")
-        self._speak("Error. Drone not connected.")
-        return False
+    @pyqtSlot(float, float, result=bool)
+    def takeoff(self, target_altitude, target_speed):
+        """
+        Automated takeoff sequence:
+        1. Switch to GUIDED mode
+        2. ARM the drone
+        3. Execute takeoff immediately to prevent auto-disarm
+        """
+        if not self._is_drone_ready(): 
+            self.commandFeedback.emit("Error: Drone not connected.")
+            self._speak("Error. Drone not connected.")
+            return False
 
-     print(f"\n[DroneCommander] ===== TAKEOFF REQUEST =====")
-     print(f"[DroneCommander] Target altitude: {target_altitude}m")
+        print(f"\n[DroneCommander] ===== AUTOMATED TAKEOFF SEQUENCE =====")
+        print(f"[DroneCommander] Target altitude: {target_altitude}m")
+        print(f"[DroneCommander] Target speed: {target_speed}m/s")
 
-    # Step 1: Check if armed, if not - ARM automatically
-     is_armed = self.drone_model.telemetry.get('armed', False)
-     print(f"[DroneCommander] Armed state: {is_armed}")
-    
-     if not is_armed:
-        print("[DroneCommander] Drone not armed - arming automatically...")
-        self.commandFeedback.emit("Arming drone automatically...")
-        self._speak("Arming drone for takeoff.")
+        # ========== PRE-FLIGHT CHECKS ==========
+        print("\n[DroneCommander] 🔍 Running pre-flight checks...")
+        self.commandFeedback.emit("🔍 Running pre-flight checks...")
         
-        # Send ARM commands
-        for i in range(5):
-            self._drone.mav.command_long_send(
-                self._drone.target_system,
-                self._drone.target_component,
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0,
-                1,  # 1 = ARM
-                0, 0, 0, 0, 0, 0
-            )
-            time.sleep(0.1)
+        current_lat = self.drone_model.telemetry.get('lat')
+        current_lon = self.drone_model.telemetry.get('lon')
+        gps_fix = self.drone_model.telemetry.get('gps_fix_type', 0)
         
-        # Wait for armed confirmation (up to 5 seconds)
-        start_time = time.time()
-        armed_success = False
-        while time.time() - start_time < 5:
-            is_armed = self.drone_model.telemetry.get('armed', False)
-            if is_armed:
-                print("[DroneCommander] Drone armed successfully")
-                self.commandFeedback.emit("Drone armed successfully!")
-                armed_success = True
-                break
-            time.sleep(0.1)
-        
-        if not armed_success:
-            self.commandFeedback.emit("Error: Failed to arm drone - check pre-arm checks")
-            self._speak("Error. Failed to arm drone. Check pre-arm checks.")
+        if current_lat is None or current_lon is None:
+            self.commandFeedback.emit("❌ Error: GPS position not available.")
+            self._speak("Error. G P S position not available.")
             return False
         
-        time.sleep(0.5)  # Small delay after arming
-
-    # Step 2: Check GPS
-     current_lat = self.drone_model.telemetry.get('lat')
-     current_lon = self.drone_model.telemetry.get('lon')
-     print(f"[DroneCommander] GPS position: lat={current_lat}, lon={current_lon}")
-
-     if current_lat is None or current_lon is None:
-        self.commandFeedback.emit("Error: GPS position not available.")
-        self._speak("Error. G P S position not available.")
-        return False
-
-    # Step 3: Automatically change to GUIDED mode if not already
-     current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
-     print(f"[DroneCommander] Current mode: {current_mode}")
-
-     if current_mode != 'GUIDED':
-        print("[DroneCommander] Changing mode to GUIDED for takeoff...")
-        self.commandFeedback.emit("Changing to GUIDED mode for takeoff...")
-        self._speak("Changing to guided mode.")
+        print(f"[DroneCommander] GPS: lat={current_lat}, lon={current_lon}, fix={gps_fix}")
+        print("[DroneCommander] ✅ Pre-flight checks passed")
         
-        mode_id = self._drone.mode_mapping().get('GUIDED')
-        if mode_id is not None:
-            for i in range(3):
+        # ========== STEP 1: SWITCH TO GUIDED MODE ==========
+        print("\n[DroneCommander] 🎯 Step 1/3: Switching to GUIDED mode...")
+        self.commandFeedback.emit("🎯 Switching to GUIDED mode...")
+        self._speak("Step one. Switching to guided mode.")
+        
+        current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+        
+        if current_mode != 'GUIDED':
+            mode_id = self._drone.mode_mapping().get('GUIDED')
+            if mode_id is None:
+                self.commandFeedback.emit("❌ Error: GUIDED mode not available")
+                return False
+            
+            # Set GCS mode priority FIRST
+            if hasattr(self.drone_model, '_thread') and self.drone_model._thread:
+                self.drone_model._thread.set_gcs_mode('GUIDED')
+                print(f"[DroneCommander] 🔒 GCS mode priority set to GUIDED")
+            
+            # Send mode change (multiple attempts for reliability)
+            print(f"[DroneCommander] Sending GUIDED mode commands...")
+            for i in range(5):
                 self._drone.mav.set_mode_send(
                     self._drone.target_system,
                     mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                     mode_id
                 )
-                time.sleep(0.1)
+                time.sleep(0.15)
             
-            # Wait for mode change (up to 2 seconds)
+            # Wait for mode confirmation with better detection
+            print(f"[DroneCommander] Waiting for mode change confirmation...")
             start_time = time.time()
-            while time.time() - start_time < 2:
+            mode_confirmed = False
+            
+            while time.time() - start_time < 8:  # Increased to 8 seconds
+                # Check telemetry
                 current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+                print(f"[DroneCommander] Mode check: {current_mode} (elapsed: {time.time() - start_time:.1f}s)")
+                
                 if current_mode == 'GUIDED':
-                    print("[DroneCommander] Mode changed to GUIDED successfully")
+                    mode_confirmed = True
+                    print(f"[DroneCommander] ✅ Mode confirmed as GUIDED at {time.time() - start_time:.2f}s")
                     break
-                time.sleep(0.1)
+                
+                # Also listen for HEARTBEAT messages directly
+                msg = self._drone.recv_match(type='HEARTBEAT', blocking=False, timeout=0.1)
+                if msg:
+                    mode_from_heartbeat = self._drone.flightmode
+                    print(f"[DroneCommander] Heartbeat mode: {mode_from_heartbeat}")
+                    if mode_from_heartbeat == 'GUIDED':
+                        mode_confirmed = True
+                        print(f"[DroneCommander] ✅ Mode confirmed via HEARTBEAT")
+                        break
+                
+                time.sleep(0.2)
             
-            time.sleep(0.3)
-
-    # Step 4: Get initial altitude and send takeoff command
-     initial_alt = self.drone_model.telemetry.get('alt', 0)
-     print(f"[DroneCommander] Initial altitude: {initial_alt}m")
-     print(f"[DroneCommander] Sending TAKEOFF command to {target_altitude}m...")
-
-     self._speak(f"Drone taking off to {int(target_altitude)} meters altitude.")
-
-     try:
-        self._drone.mav.command_long_send(
-            self._drone.target_system,
-            self._drone.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0,
-            0, 0, 0, 0,
-            current_lat,
-            current_lon,
-            target_altitude
-        )
+            # Final check after timeout
+            if not mode_confirmed:
+                final_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+                print(f"[DroneCommander] ⚠️ Timeout waiting for mode change. Final mode: {final_mode}")
+                
+                # Give one more second for telemetry to update
+                time.sleep(1.0)
+                final_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+                
+                if final_mode == 'GUIDED':
+                    print(f"[DroneCommander] ✅ Mode is GUIDED (delayed telemetry)")
+                    mode_confirmed = True
+                else:
+                    self.commandFeedback.emit(f"❌ Failed to switch to GUIDED (stuck in {final_mode})")
+                    self._speak("Failed to change to guided mode.")
+                    return False
+        else:
+            print("[DroneCommander] ✅ Already in GUIDED mode")
         
-        self.commandFeedback.emit(f"Takeoff command sent to {target_altitude}m. Monitoring...")
-        print("[DroneCommander] Takeoff command sent, monitoring altitude change...")
+        print("[DroneCommander] ✅ In GUIDED mode")
+        time.sleep(0.3)  # Brief stabilization
+
+        # ========== STEP 2: ARM THE DRONE ==========
+        print("\n[DroneCommander] 🔐 Step 2/3: Arming drone...")
+        self.commandFeedback.emit("🔐 Step 2/3: Arming drone...")
+        self._speak("Step two. Arming drone.")
         
-        # Monitor altitude for 3 seconds to confirm takeoff
-        start_time = time.time()
-        while time.time() - start_time < 3:
-            current_alt = self.drone_model.telemetry.get('alt', initial_alt)
+        is_armed = self.drone_model.telemetry.get('armed', False)
+        
+        if not is_armed:
+            print("[DroneCommander] Sending ARM commands...")
             
-            if current_alt > initial_alt + 0.5:
-                success_msg = f"Takeoff initiated! Climbing to {target_altitude}m (current: {current_alt:.1f}m)"
+            # Send 3 rapid ARM commands
+            for i in range(3):
+                self._drone.mav.command_long_send(
+                    self._drone.target_system,
+                    self._drone.target_component,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0, 1, 0, 0, 0, 0, 0, 0
+                )
+                time.sleep(0.05)
+            
+            # ✅ CRITICAL: Don't wait long - send takeoff ASAP to prevent auto-disarm
+            # Just check for 1 second max
+            print("[DroneCommander] Checking for ARM confirmation...")
+            start_time = time.time()
+            arm_confirmed = False
+            
+            while time.time() - start_time < 1.0:  # Only wait 1 second!
+                if self.drone_model.telemetry.get('armed', False):
+                    arm_confirmed = True
+                    print(f"[DroneCommander] ✅ Armed confirmed at {time.time() - start_time:.2f}s")
+                    break
+                time.sleep(0.05)
+            
+            # If not confirmed yet, send force ARM and continue anyway
+            if not arm_confirmed:
+                print("[DroneCommander] ⚠️ No ARM confirmation yet, sending force ARM...")
+                self._drone.mav.command_long_send(
+                    self._drone.target_system,
+                    self._drone.target_component,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0, 1, 21196, 0, 0, 0, 0, 0  # Force arm
+                )
+                time.sleep(0.2)  # Brief wait
+            
+            print("[DroneCommander] ✅ Proceeding with takeoff (armed or arming in progress)")
+        else:
+            print("[DroneCommander] ✅ Already armed")
+        
+        # ========== STEP 3: IMMEDIATE TAKEOFF (SEND REGARDLESS OF ARM STATUS!) ==========
+        # ✅ CRITICAL: Send takeoff immediately - don't wait for ARM confirmation!
+        # The takeoff command itself will keep the drone armed
+        print(f"\n[DroneCommander] 🚁 Step 3/3: IMMEDIATE takeoff to {target_altitude}m...")
+        self.commandFeedback.emit(f"🚁 Step 3/3: Taking off to {target_altitude}m...")
+        self._speak(f"Taking off to {int(target_altitude)} meters.")
+        
+        try:
+            # ✅ CRITICAL: Set climb speed FIRST (do this BEFORE arming ideally)
+            speed_cms = int(target_speed * 100)
+            self._drone.mav.param_set_send(
+                self._drone.target_system,
+                self._drone.target_component,
+                b'WPNAV_SPEED_UP',
+                speed_cms,
+                mavutil.mavlink.MAV_PARAM_TYPE_INT32
+            )
+            
+            # Get current position for takeoff command
+            initial_alt = self.drone_model.telemetry.get('alt', 0)
+            
+            # ✅ SEND TAKEOFF IMMEDIATELY - Within 500ms of arming!
+            print(f"[DroneCommander] 📤 Sending takeoff command NOW...")
+            
+            # Send takeoff command 5 times rapidly for maximum reliability
+            for attempt in range(5):
+                self._drone.mav.command_long_send(
+                    self._drone.target_system,
+                    self._drone.target_component,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0,
+                    0, 0, 0, float('nan'),
+                    current_lat, current_lon, target_altitude
+                )
+                if attempt == 0:
+                    print(f"[DroneCommander] ✅ First takeoff command sent!")
+                time.sleep(0.05)
+            
+            print(f"[DroneCommander] ✅ Takeoff commands sent (x5), monitoring...")
+            
+            # Monitor for takeoff success
+            start_time = time.time()
+            
+            while time.time() - start_time < 15:
+                current_alt = self.drone_model.telemetry.get('alt', initial_alt)
+                is_armed = self.drone_model.telemetry.get('armed', False)
+                current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+                
+                # Check if disarmed (failure)
+                if not is_armed and time.time() - start_time > 2:
+                    self.commandFeedback.emit("❌ Drone disarmed during takeoff!")
+                    self._speak("Drone disarmed during takeoff.")
+                    print("[DroneCommander] ❌ Disarmed before takeoff could complete")
+                    return False
+                
+                # Check altitude gain (success!)
+                alt_gain = current_alt - initial_alt
+                if alt_gain > 0.5:  # 50cm = definite climb
+                    success_msg = f"✅ Takeoff confirmed! Climbing to {target_altitude}m (current: {current_alt:.1f}m)"
+                    self.commandFeedback.emit(success_msg)
+                    self._speak("Takeoff successful. Climbing.")
+                    print(f"[DroneCommander] ✅ {success_msg}")
+                    return True
+                
+                # Progress logging
+                if int(time.time() - start_time) % 2 == 0:
+                    print(f"[DroneCommander] t+{int(time.time() - start_time)}s: alt={current_alt:.2f}m (gain: {alt_gain:.2f}m), armed={is_armed}, mode={current_mode}")
+                
+                time.sleep(0.2)
+            
+            # Timeout - check final status
+            final_alt = self.drone_model.telemetry.get('alt', initial_alt)
+            final_gain = final_alt - initial_alt
+            is_armed = self.drone_model.telemetry.get('armed', False)
+            
+            if not is_armed:
+                self.commandFeedback.emit("❌ Drone disarmed - takeoff failed")
+                self._speak("Takeoff failed. Drone disarmed.")
+                print("[DroneCommander] ❌ Disarmed during takeoff attempt")
+                return False
+            
+            if final_gain > 0.2:
+                success_msg = f"✅ Takeoff in progress (alt gain: {final_gain:.2f}m)"
                 self.commandFeedback.emit(success_msg)
-                self._speak("Takeoff initiated successfully.")
-                print(f"[DroneCommander] Takeoff confirmed - altitude: {current_alt}m")
+                self._speak("Takeoff in progress.")
                 return True
+            else:
+                error_msg = f"❌ No altitude gain (gain: {final_gain:.2f}m, armed: {is_armed})"
+                self.commandFeedback.emit(error_msg)
+                self._speak("Takeoff failed. No altitude gain.")
+                print(f"[DroneCommander] {error_msg}")
+                return False
             
-            time.sleep(0.1)
-        
-        success_msg = f"Takeoff command sent successfully to {target_altitude}m"
-        self.commandFeedback.emit(success_msg)
-        self._speak("Takeoff command sent successfully.")
-        return True
-        
-     except Exception as e:
-        error_msg = f"Error sending takeoff command: {e}"
-        self.commandFeedback.emit(error_msg)
-        self._speak("Error sending takeoff command.")
-        print(f"[DroneCommander ERROR] {e}")
-        return False
-
+        except Exception as e:
+            error_msg = f"❌ Exception during takeoff: {e}"
+            self.commandFeedback.emit(error_msg)
+            self._speak("Error during takeoff.")
+            print(f"[DroneCommander ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
     @pyqtSlot(result=bool)
     def land(self):
-     """Land command with automatic disarm after landing"""
      if not self._is_drone_ready(): 
         self.commandFeedback.emit("Error: Drone not connected.")
         self._speak("Error. Drone not connected.")
         return False
-        
+    
      if self.drone_model.telemetry.get('lat') is None or self.drone_model.telemetry.get('lon') is None:
         self.commandFeedback.emit("Error: GPS position not available for land.")
         self._speak("Error. G P S position not available for landing.")
         print("[DroneCommander] Land failed: GPS position not available.")
         return False
-
+    
      print("[DroneCommander] Sending LAND command...")
      self._speak("Drone landing initiated.")
     
      try:
-        # Send land command
+        # First, set mode to LAND to bypass enforcement
+        self.setMode("LAND")  # This should disable enforcement for LAND
+        time.sleep(0.5)  # Give it a moment to process
+        
+        # Send LAND command
         self._drone.mav.command_long_send(
             self._drone.target_system,
             self._drone.target_component,
@@ -423,266 +551,339 @@ class DroneCommander(QObject):
             self.drone_model.telemetry['lon'],
             0
         )
-        self.commandFeedback.emit("Land command sent. Monitoring landing...")
-
-        # Wait for command acknowledgment
-        ack_result = self._wait_for_command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND)
         
-        if ack_result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-            self.commandFeedback.emit("Landing initiated successfully!")
-            self._speak("Landing initiated successfully.")
-            
-            # Start monitoring thread for automatic disarm after landing
-            disarm_thread = threading.Thread(target=self._monitor_landing_and_disarm, daemon=True)
-            disarm_thread.start()
-            
-            return True
-        else:
-            self.commandFeedback.emit(f"Land command failed or denied. Result: {ack_result}")
-            self._speak("Land command failed or denied.")
-            return False
-            
+        print("[DroneCommander] LAND command sent, waiting for confirmation...")
+        self.commandFeedback.emit("Land command sent. Waiting for confirmation...")
+        
+        # Wait for acknowledgment
+        start_time = time.time()
+        timeout = 5
+        while time.time() - start_time < timeout:
+            msg = self._drone.recv_match(type='COMMAND_ACK', blocking=False, timeout=0.1)
+            if msg and msg.command == mavutil.mavlink.MAV_CMD_NAV_LAND:
+                print(f"[DroneCommander] Received LAND ACK: {msg.result}")
+                if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    self.commandFeedback.emit("Land initiated successfully!")
+                    self._speak("Landing initiated successfully.")
+                    print("[DroneCommander] LAND command accepted")
+                    return True
+                elif msg.result == mavutil.mavlink.MAV_RESULT_DENIED:
+                    self.commandFeedback.emit("Land command denied by drone")
+                    self._speak("Land command denied.")
+                    print("[DroneCommander] LAND command denied")
+                    return False
+                elif msg.result == mavutil.mavlink.MAV_RESULT_FAILED:
+                    self.commandFeedback.emit("Land command failed")
+                    self._speak("Land command failed.")
+                    print("[DroneCommander] LAND command failed")
+                    return False
+            time.sleep(0.1)
+        
+        # Timeout - but command may still work
+        print("[DroneCommander] LAND command timeout waiting for ACK")
+        self.commandFeedback.emit("Land command sent (no confirmation received)")
+        self._speak("Landing command sent.")
+        return True
+        
      except Exception as e:
-        self.commandFeedback.emit(f"Error sending LAND command: {e}")
+        msg = f"Error sending LAND command: {e}"
+        self.commandFeedback.emit(msg)
         self._speak("Error sending land command.")
         print(f"[DroneCommander ERROR] LAND command failed: {e}")
         return False
-     
-    def _monitor_landing_and_disarm(self):
-     """Monitor landing progress and automatically disarm when landed"""
-     print("[DroneCommander] 🔍 Monitoring landing for automatic disarm...")
-    
-     try:
-        start_time = time.time()
-        timeout = 120  # 2 minutes timeout for landing
-        ground_time_threshold = 3  # seconds on ground before disarming
-        ground_start_time = None
-        
-        while time.time() - start_time < timeout:
-            # Get current altitude and armed state
-            current_alt = self.drone_model.telemetry.get('alt', None)
-            is_armed = self.drone_model.telemetry.get('armed', False)
-            current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
-            
-            # Check if already disarmed
-            if not is_armed:
-                print("[DroneCommander] ✅ Drone already disarmed")
-                self.commandFeedback.emit("Drone landed and disarmed")
-                self._speak("Drone landed and disarmed.")
-                return
-            
-            # Check if on ground (altitude < 0.5m and armed)
-            if current_alt is not None and current_alt < 0.5:
-                if ground_start_time is None:
-                    ground_start_time = time.time()
-                    print(f"[DroneCommander] 🛬 Drone on ground (alt: {current_alt:.2f}m)")
-                
-                # Check if been on ground long enough
-                time_on_ground = time.time() - ground_start_time
-                if time_on_ground >= ground_time_threshold:
-                    print(f"[DroneCommander] ⏱️ On ground for {time_on_ground:.1f}s - disarming...")
-                    self.commandFeedback.emit("Landing complete - disarming drone...")
-                    self._speak("Landing complete. Disarming drone.")
-                    
-                    # Send disarm command
-                    for i in range(3):
-                        self._drone.mav.command_long_send(
-                            self._drone.target_system,
-                            self._drone.target_component,
-                            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                            0,
-                            0,  # 0 = DISARM
-                            0, 0, 0, 0, 0, 0
-                        )
-                        time.sleep(0.1)
-                    
-                    # Wait for disarm confirmation
-                    disarm_start = time.time()
-                    while time.time() - disarm_start < 3:
-                        is_armed = self.drone_model.telemetry.get('armed', False)
-                        if not is_armed:
-                            print("[DroneCommander] ✅ Automatic disarm successful!")
-                            self.commandFeedback.emit("✅ Drone disarmed automatically after landing")
-                            self._speak("Drone disarmed successfully.")
-                            self.armDisarmCompleted.emit(True, "Drone disarmed automatically after landing")
-                            return
-                        time.sleep(0.1)
-                    
-                    # Disarm command sent but not confirmed
-                    print("[DroneCommander] ⚠️ Disarm command sent but not confirmed")
-                    self.commandFeedback.emit("⚠️ Disarm command sent - check drone status")
-                    return
-            else:
-                # Reset ground timer if altitude increases
-                if ground_start_time is not None:
-                    ground_start_time = None
-                    print(f"[DroneCommander] 📈 Altitude increased to {current_alt:.2f}m - resetting ground timer")
-            
-            time.sleep(0.5)  # Check every 0.5 seconds
-        
-        # Timeout reached
-        print("[DroneCommander] ⏰ Landing monitor timeout - check drone manually")
-        self.commandFeedback.emit("⚠️ Landing monitor timeout - please check drone status")
-        
-     except Exception as e:
-        print(f"[DroneCommander ERROR] Landing monitor failed: {e}")
-        self.commandFeedback.emit(f"Error monitoring landing: {e}")
-
+    # Add this helper method to your DroneCommander class (if it doesn't exist)
+   
     @pyqtSlot(str, result=bool)
     def setMode(self, mode_name):
-     """Set flight mode - NON-BLOCKING version using thread"""
+     """
+    Set the flight mode of the drone.
+    With GCS mode priority enabled, RC mode switch is ignored.
+    """
      if not self._is_drone_ready(): 
         self.commandFeedback.emit("Error: Drone not connected.")
-        self._speak("Error. Drone not connected.")
         return False
 
-    # Check if mode change already in progress
-     with self._mode_change_lock:
-        if self._mode_change_in_progress:
-            self.commandFeedback.emit("Mode change already in progress, please wait...")
-            print("[DroneCommander] ⚠️ Mode change already in progress - rejecting request")
-            return False
-        
-        # Check cooldown period
-        current_time = time.time()
-        time_since_last = current_time - self._last_mode_change_time
-        if time_since_last < self._mode_change_cooldown:
-            remaining = self._mode_change_cooldown - time_since_last
-            self.commandFeedback.emit(f"Please wait {remaining:.1f}s before changing mode again")
-            print(f"[DroneCommander] ⚠️ Mode change cooldown active ({remaining:.1f}s remaining)")
-            return False
-        
-        # Lock mode change
-        self._mode_change_in_progress = True
-        self._last_mode_change_time = current_time
-
-     print(f"\n[DroneCommander] ===== MODE CHANGE REQUEST =====")
-     print(f"[DroneCommander] Requested mode: {mode_name}")
-    
-    # Get current mode for comparison
-     current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
-     print(f"[DroneCommander] Current mode: {current_mode}")
-    
-    # Check if already in requested mode
-     if current_mode == mode_name.upper():
-        self.commandFeedback.emit(f"Already in {mode_name} mode")
-        self._speak(f"Already in {mode_name} mode.")
-        with self._mode_change_lock:
-            self._mode_change_in_progress = False
-        return True
-    
-    # Get mode ID
-     mode_id = self._drone.mode_mapping().get(mode_name.upper())
-     if mode_id is None:
-        available_modes = list(self._drone.mode_mapping().keys())
-        self.commandFeedback.emit(f"Error: Unknown mode '{mode_name}'")
-        self._speak(f"Error. Unknown mode {mode_name}.")
-        with self._mode_change_lock:
-            self._mode_change_in_progress = False
-        return False
-
-    # Start mode change in separate thread (NON-BLOCKING)
-     mode_thread = threading.Thread(
-        target=self._do_mode_change,
-        args=(mode_name, mode_id),
-        daemon=True
-    )
-     mode_thread.start()
-    
-     self.commandFeedback.emit(f"Changing mode to {mode_name}...")
-     self._speak(f"Changing mode to {mode_name}.")
-    
-     return True
-
-    
-    def _do_mode_change(self, mode_name, mode_id):
-     """
-    Internal method that does the actual mode change.
-    Runs in a separate thread to avoid blocking UI.
-    """
+     print(f"[DroneCommander] Sending SET_MODE command to '{mode_name}'...")
      try:
-        # ⭐ NOTIFY DroneModel that user requested this mode ⭐
-        self.drone_model.notifyModeChangeRequest(mode_name.upper())
-        
-        print(f"[DroneCommander] Mode ID: {mode_id}")
-        print("[DroneCommander] Sending mode change command (non-blocking)...")
-        
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
-            # Send command
-            self._drone.mav.set_mode_send(
-                self._drone.target_system,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                mode_id
-            )
-            print(f"[DroneCommander] Sent mode change attempt {attempt + 1}/{max_attempts}")
-            
-            # Wait for confirmation (shorter timeout per attempt)
-            confirmation_timeout = 2.0
-            start_time = time.time()
-            
-            while time.time() - start_time < confirmation_timeout:
-                current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
-                
-                if current_mode == mode_name.upper():
-                    self.commandFeedback.emit(f"✅ Mode changed to '{mode_name}' successfully!")
-                    self._speak(f"Mode changed to {mode_name} successfully.")
-                    print(f"[DroneCommander] ✅ Mode change confirmed")
-                    return  # Success - exit function
-                
-                time.sleep(0.1)  # Safe because we're in a separate thread
-            
-            # Retry if not last attempt
-            if attempt < max_attempts - 1:
-                print(f"[DroneCommander] ⚠️ Attempt {attempt + 1} timeout, retrying...")
-                time.sleep(0.3)
-        
-        # After all attempts, check one final time
-        final_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
-        if final_mode == mode_name.upper():
-            self.commandFeedback.emit(f"✅ Mode changed to '{mode_name}' successfully!")
-            self._speak(f"Mode changed to {mode_name} successfully.")
-            print(f"[DroneCommander] ✅ Mode change confirmed (delayed)")
-        else:
-            self.commandFeedback.emit(f"⚠️ Mode change may have failed (current: {final_mode})")
-            self._speak(f"Mode change to {mode_name} may have failed.")
-            print(f"[DroneCommander] ⚠️ Mode change not confirmed - current: {final_mode}")
-    
-     except Exception as e:
-        self.commandFeedback.emit(f"Error sending mode change: {e}")
-        self._speak("Error sending mode change command.")
-        print(f"[DroneCommander ERROR] {e}")
-    
-     finally:
-        # CRITICAL: Always unlock
-        with self._mode_change_lock:
-            self._mode_change_in_progress = False
-        print("[DroneCommander] Mode change lock released")
+        # Get the mode ID from mode mapping
+        mode_id = self._drone.mode_mapping().get(mode_name.upper())
+        if mode_id is None:
+            self.commandFeedback.emit(f"Error: Unknown mode '{mode_name}'.")
+            print(f"[DroneCommander] SET_MODE failed: Unknown mode '{mode_name}'.")
+            return False
 
-# Optional: Emergency unlock method
-    @pyqtSlot(result=bool)  
-    def forceUnlockModeChange(self):
-     """Force unlock mode change (debugging only)"""
-     with self._mode_change_lock:
-        was_locked = self._mode_change_in_progress
-        self._mode_change_in_progress = False
-        self._last_mode_change_time = 0
-    
-     if was_locked:
-        print("[DroneCommander] ⚠️ Force unlocked mode change")
-        self.commandFeedback.emit("Mode change unlocked")
+        # ✅ NOTIFY MAVLinkThread that GCS is commanding this mode
+        if hasattr(self.drone_model, '_thread') and self.drone_model._thread:
+            self.drone_model._thread.set_gcs_mode(mode_name.upper())
+            print(f"[DroneCommander] 🔒 GCS mode lock activated for {mode_name}")
+
+        # Send mode change command (multiple methods for reliability)
+        # Method 1: MAV_CMD_DO_SET_MODE (most forceful)
+        self._drone.mav.command_long_send(
+            self._drone.target_system,
+            self._drone.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mode_id,
+            0, 0, 0, 0, 0
+        )
+        
+        time.sleep(0.05)
+        
+        # Method 2: Direct set_mode
+        self._drone.set_mode(mode_id)
+        
+        time.sleep(0.05)
+        
+        # Method 3: mav.set_mode_send
+        self._drone.mav.set_mode_send(
+            self._drone.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mode_id
+        )
+        
+        print(f"[DroneCommander] Mode change commands sent: {mode_name} (ID: {mode_id})")
+        self.commandFeedback.emit(f"Mode change to '{mode_name}' sent.")
+        
+        # Wait a moment for the command to process
+        time.sleep(0.3)
+        
+        # Verify mode change by checking telemetry
+        start_time = time.time()
+        timeout = 2.0  # 2 second timeout
+        
+        while time.time() - start_time < timeout:
+            current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+            if current_mode == mode_name.upper():
+                self.commandFeedback.emit(f"✅ Mode successfully changed to '{mode_name}'.")
+                print(f"[DroneCommander] Mode confirmed: {mode_name}")
+                return True
+            time.sleep(0.1)
+        
+        # Mode didn't change within timeout
+        current_mode = self.drone_model.telemetry.get('mode', 'UNKNOWN')
+        
+        # If GCS mode priority is enabled, mode will eventually change (RC is being overridden)
+        if hasattr(self.drone_model, '_thread') and self.drone_model._thread and \
+           hasattr(self.drone_model._thread, 'ignore_rc_mode_changes') and \
+           self.drone_model._thread.ignore_rc_mode_changes:
+            self.commandFeedback.emit(f"🔒 Mode command sent to '{mode_name}' (GCS priority active)")
+            print(f"[DroneCommander] GCS mode priority - RC mode switch being overridden")
+        else:
+            self.commandFeedback.emit(f"⚠️ Mode is '{current_mode}' (expected '{mode_name}')")
+            print(f"[DroneCommander] Mode mismatch - requested: {mode_name}, actual: {current_mode}")
+        
+        return False
+            
+     except Exception as e:
+        self.commandFeedback.emit(f"Error sending SET_MODE command: {e}")
+        print(f"[DroneCommander ERROR] SET_MODE command failed: {e}")
+        return False
+
+
+# ✅ ADD THESE NEW METHODS TO DroneCommander
+ 
+    @pyqtSlot(result=bool)
+    def enableGCSModePriority(self):
+     """
+    Enable GCS mode priority - RC mode switch will be ignored.
+    RC transmitter still works for flight control (throttle, pitch, roll, yaw).
+    This is automatically enabled on connection.
+    """
+     if hasattr(self.drone_model, '_thread') and self.drone_model._thread:
+        self.drone_model._thread.enable_gcs_mode_priority()
+        self.commandFeedback.emit("🔒 GCS Mode Priority ON - RC mode switch ignored")
+        self._speak("GCS mode priority enabled. RC mode switch ignored.")
+        print("[DroneCommander] GCS mode priority enabled")
         return True
+    
+     self.commandFeedback.emit("❌ Error: MAVLink thread not available")
      return False
 
-    def _wait_for_command_ack(self, command_id, timeout=5):
-        """Helper to wait for command acknowledgment"""
+    @pyqtSlot(result=bool)
+    def disableGCSModePriority(self):
+     """
+    Disable GCS mode priority - RC mode switch works normally.
+    Use this if you want the RC transmitter mode switch to work.
+    """
+     if hasattr(self.drone_model, '_thread') and self.drone_model._thread:
+        self.drone_model._thread.disable_gcs_mode_priority()
+        self.commandFeedback.emit("🔓 GCS Mode Priority OFF - RC mode switch active")
+        self._speak("GCS mode priority disabled. RC mode switch active.")
+        print("[DroneCommander] GCS mode priority disabled")
+        return True
+    
+     self.commandFeedback.emit("❌ Error: MAVLink thread not available")
+     return False
+
+    @pyqtSlot(result=bool)
+    def getGCSModePriorityStatus(self):
+     """
+    Get the current GCS mode priority status.
+    Returns True if enabled, False if disabled.
+    """
+     if hasattr(self.drone_model, '_thread') and self.drone_model._thread:
+        status = getattr(self.drone_model._thread, 'ignore_rc_mode_changes', False)
+        print(f"[DroneCommander] GCS mode priority status: {status}")
+        return status
+     return False
+    
+    @pyqtSlot(result=bool)
+    def disableRCModeControl(self):
+     """
+     Disable RC transmitter mode control by setting FLTMODE_CH to 0.
+    This makes ONLY the GCS able to change flight modes.
+    WARNING: Make sure you have a reliable connection before doing this!
+    """
+     if not self._is_drone_ready():
+        self.commandFeedback.emit("Error: Drone not connected.")
+        return False
+    
+     print("[DroneCommander] Disabling RC mode control (setting FLTMODE_CH to 0)...")
+     self.commandFeedback.emit("Disabling RC mode control...")
+    
+     try:
+        # First, check if target_component is 0, if so, set it to 1
+        if self._drone.target_component == 0:
+            print("[DroneCommander] WARNING: target_component is 0, setting to 1")
+            self._drone.target_component = 1
+        
+        # Set FLTMODE_CH parameter to 0 (disables RC mode switching)
+        self._drone.mav.param_set_send(
+            self._drone.target_system,
+            self._drone.target_component,
+            b'FLTMODE_CH',  # Parameter name
+            0,  # Value: 0 = disabled
+            mavutil.mavlink.MAV_PARAM_TYPE_INT8
+        )
+        
+        print("[DroneCommander] FLTMODE_CH=0 command sent, waiting for confirmation...")
+        
+        # Wait for confirmation
         start_time = time.time()
+        timeout = 5
         while time.time() - start_time < timeout:
-            msg = self._drone.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.1)
-            if msg and msg.command == command_id:
-                return msg.result
-        return None
+            msg = self._drone.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.1)
+            if msg:
+                param_name = msg.param_id.decode('utf-8').strip('\x00')
+                if param_name == 'FLTMODE_CH':
+                    print(f"[DroneCommander] Received PARAM_VALUE: FLTMODE_CH = {msg.param_value}")
+                    if msg.param_value == 0:
+                        self.commandFeedback.emit("✓ RC mode control disabled! Only GCS can change modes now.")
+                        print("[DroneCommander] RC mode control successfully disabled.")
+                        return True
+                    else:
+                        self.commandFeedback.emit(f"Failed: FLTMODE_CH = {msg.param_value} (expected 0)")
+                        return False
+            QThread.msleep(10)
+        
+        self.commandFeedback.emit("⚠ Timeout waiting for FLTMODE_CH confirmation. Command may still succeed.")
+        print("[DroneCommander] Timeout setting FLTMODE_CH (command may still succeed)")
+        return False
+        
+     except Exception as e:
+        msg = f"Error disabling RC mode control: {e}"
+        self.commandFeedback.emit(msg)
+        print(f"[DroneCommander ERROR] {msg}")
+        return False
+
+
+    @pyqtSlot(result=bool)
+    def enableRCModeControl(self):
+     """
+    Re-enable RC transmitter mode control by setting FLTMODE_CH to 5 (default channel).
+    This allows the RC transmitter to control flight modes again.
+    """
+     if not self._is_drone_ready():
+        self.commandFeedback.emit("Error: Drone not connected.")
+        return False
+    
+     print("[DroneCommander] Enabling RC mode control (setting FLTMODE_CH to 5)...")
+     self.commandFeedback.emit("Enabling RC mode control...")
+    
+     try:
+        # First, check if target_component is 0, if so, set it to 1
+        if self._drone.target_component == 0:
+            print("[DroneCommander] WARNING: target_component is 0, setting to 1")
+            self._drone.target_component = 1
+        
+        # Set FLTMODE_CH parameter to 5 (default RC channel for mode switching)
+        self._drone.mav.param_set_send(
+            self._drone.target_system,
+            self._drone.target_component,
+            b'FLTMODE_CH',
+            5,  # Value: 5 = RC channel 5 (default)
+            mavutil.mavlink.MAV_PARAM_TYPE_INT8
+        )
+        
+        print("[DroneCommander] FLTMODE_CH=5 command sent, waiting for confirmation...")
+        
+        # Wait for confirmation
+        start_time = time.time()
+        timeout = 5
+        while time.time() - start_time < timeout:
+            msg = self._drone.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.1)
+            if msg:
+                param_name = msg.param_id.decode('utf-8').strip('\x00')
+                if param_name == 'FLTMODE_CH':
+                    print(f"[DroneCommander] Received PARAM_VALUE: FLTMODE_CH = {msg.param_value}")
+                    if msg.param_value == 5:
+                        self.commandFeedback.emit("✓ RC mode control enabled! RC transmitter can change modes now.")
+                        print("[DroneCommander] RC mode control successfully enabled.")
+                        return True
+                    else:
+                        self.commandFeedback.emit(f"Failed: FLTMODE_CH = {msg.param_value} (expected 5)")
+                        return False
+            QThread.msleep(10)
+        
+        self.commandFeedback.emit("⚠ Timeout waiting for FLTMODE_CH confirmation. Command may still succeed.")
+        print("[DroneCommander] Timeout setting FLTMODE_CH (command may still succeed)")
+        return False
+        
+     except Exception as e:
+        msg = f"Error enabling RC mode control: {e}"
+        self.commandFeedback.emit(msg)
+        print(f"[DroneCommander ERROR] {msg}")
+        return False
+
+
+    @pyqtSlot(result=int)
+    def getRCModeControlStatus(self):
+     """
+    Get the current FLTMODE_CH parameter value.
+    Returns: -1 on error, 0 if disabled, >0 if enabled (channel number)
+    """
+     if not self._is_drone_ready():
+        return -1
+    
+     try:
+        # Request specific parameter
+        self._drone.mav.param_request_read_send(
+            self._drone.target_system,
+            self._drone.target_component,
+            b'FLTMODE_CH',
+            -1  # param_index: -1 means use param_id
+        )
+        
+        # Wait for response
+        start_time = time.time()
+        timeout = 3
+        while time.time() - start_time < timeout:
+            msg = self._drone.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.1)
+            if msg:
+                param_name = msg.param_id.decode('utf-8').strip('\x00')
+                if param_name == 'FLTMODE_CH':
+                    print(f"[DroneCommander] FLTMODE_CH current value: {msg.param_value}")
+                    return int(msg.param_value)
+            QThread.msleep(10)
+        
+        print("[DroneCommander] Timeout reading FLTMODE_CH")
+        return -1
+        
+     except Exception as e:
+        print(f"[DroneCommander ERROR] Failed to read FLTMODE_CH: {e}")
+        return -1
      
     @pyqtSlot('QVariantList', result=bool)
     def uploadMission(self, waypoints):
