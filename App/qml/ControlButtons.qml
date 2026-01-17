@@ -222,54 +222,162 @@ Row {
                 }
             }
 
-            MenuItem {
-                id: parametersMenuItem
-                property bool isClicked: false
-                text: languageManager ? languageManager.getText("Parameters") : "Parameters"
-                width: settingsButton.width
-                height: 35
+            // ==========================================
+// FIND THIS SECTION IN ControlButtons.qml (around line 180-220)
+// Replace the parametersMenuItem onTriggered handler
+// ==========================================
 
-                background: Rectangle {
-                    color: parent.hovered ? "#4CAF50" : "#ffffff"
-                    radius: 4
-                }
+MenuItem {
+    id: parametersMenuItem
+    property bool isClicked: false
+    text: languageManager ? languageManager.getText("Parameters") : "Parameters"
+    width: settingsButton.width
+    height: 35
 
-                contentItem: Text {
-                    text: parametersMenuItem.text
-                    color: parent.hovered ? "#ffffff" : "#000000"
-                    font.family: "Consolas"
-                    font.pixelSize: 16
-                    font.bold: parametersMenuItem.isClicked || parent.hovered
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                    renderType: Text.NativeRendering
-                }
+    background: Rectangle {
+        color: parent.hovered ? "#4CAF50" : "#ffffff"
+        radius: 4
+    }
 
-                onTriggered: {
-                    if (mainWindowRef && !mainWindowRef.parametersWindowInstance) {
-                        var c = Qt.createComponent("Parameters.qml")
-                        if (c.status === Component.Ready) {
-                            var w = c.createObject(mainWindowRef, {
-                                "droneCommander": droneCommander
-                            })
-                            if (w) {
-                                w.show()
-                                mainWindowRef.parametersWindowInstance = w
-                            } else {
-                                console.log("❌ Failed to create Parameters window.")
-                            }
-                        } else {
-                            console.log("❌ Error loading Parameters.qml:", c.errorString())
-                        }
-                    } else if (mainWindowRef && mainWindowRef.parametersWindowInstance) {
-                        mainWindowRef.parametersWindowInstance.visible = true
-                        mainWindowRef.parametersWindowInstance.raise()
-                    } else {
-                        console.log("❌ mainWindowRef not set.")
-                    }
-                }
+    contentItem: Text {
+        text: parametersMenuItem.text
+        color: parent.hovered ? "#ffffff" : "#000000"
+        font.family: "Consolas"
+        font.pixelSize: 16
+        font.bold: parametersMenuItem.isClicked || parent.hovered
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+        renderType: Text.NativeRendering
+    }
+
+    // ✅ REPLACE THIS ENTIRE onTriggered BLOCK:
+    onTriggered: {
+        console.log("📋 Parameters menu item triggered")
+        
+        // ✅ CHECK 1: Is drone connected?
+        if (typeof droneModel === 'undefined' || !droneModel.isConnected) {
+            console.log("❌ Drone not connected - cannot open Parameters")
+            
+            // Show error message to user
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("❌ Connect to drone before opening Parameters", "error")
             }
+            
+            // You could also show a dialog here
+            var errorDialog = Qt.createQmlObject('
+                import QtQuick 2.15
+                import QtQuick.Controls 2.15
+                Dialog {
+                    title: "Connection Required"
+                    modal: true
+                    x: (parent.width - width) / 2
+                    y: (parent.height - height) / 2
+                    standardButtons: Dialog.Ok
+                    
+                    Label {
+                        text: "Please connect to the drone before opening Parameters window."
+                        wrapMode: Text.WordWrap
+                    }
+                    
+                    onAccepted: destroy()
+                }
+            ', mainWindowRef)
+            
+            errorDialog.open()
+            return
         }
+        
+        console.log("✅ Drone is connected")
+        
+        // ✅ CHECK 2: Does droneCommander exist?
+        if (typeof droneCommander === 'undefined' || droneCommander === null) {
+            console.log("❌ droneCommander not available")
+            
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("❌ DroneCommander not available - try reconnecting", "error")
+            }
+            
+            var errorDialog2 = Qt.createQmlObject('
+                import QtQuick 2.15
+                import QtQuick.Controls 2.15
+                Dialog {
+                    title: "Not Ready"
+                    modal: true
+                    x: (parent.width - width) / 2
+                    y: (parent.height - height) / 2
+                    standardButtons: Dialog.Ok
+                    
+                    Label {
+                        text: "DroneCommander not ready. Please wait a moment after connecting."
+                        wrapMode: Text.WordWrap
+                    }
+                    
+                    onAccepted: destroy()
+                }
+            ', mainWindowRef)
+            
+            errorDialog2.open()
+            return
+        }
+        
+        console.log("✅ droneCommander available:", droneCommander)
+        
+        // ✅ CHECK 3: Get actual droneCommander from droneModel
+        var actualDroneCommander = droneModel.droneCommander
+        
+        if (actualDroneCommander === null || typeof actualDroneCommander === 'undefined') {
+            console.log("❌ droneModel.droneCommander is null")
+            
+            if (typeof messageLogger !== 'undefined') {
+                messageLogger.logMessage("❌ DroneCommander not initialized - reconnect drone", "error")
+            }
+            return
+        }
+        
+        console.log("✅ Got droneCommander from droneModel:", actualDroneCommander)
+        
+        // ✅ NOW SAFE TO OPEN PARAMETERS WINDOW
+        if (mainWindowRef && !mainWindowRef.parametersWindowInstance) {
+            console.log("📋 Creating new Parameters window...")
+            
+            var c = Qt.createComponent("Parameters.qml")
+            
+            if (c.status === Component.Ready) {
+                console.log("✅ Parameters.qml component ready")
+                
+                // Pass the ACTUAL droneCommander from droneModel
+                var w = c.createObject(mainWindowRef, {
+                    "droneCommander": actualDroneCommander,
+                    "droneModel": droneModel
+                })
+                
+                if (w) {
+                    console.log("✅ Parameters window created successfully")
+                    w.show()
+                    mainWindowRef.parametersWindowInstance = w
+                    
+                    if (typeof messageLogger !== 'undefined') {
+                        messageLogger.logMessage("📋 Parameters window opened", "info")
+                    }
+                } else {
+                    console.log("❌ Failed to create Parameters window object")
+                }
+            } else if (c.status === Component.Error) {
+                console.log("❌ Error loading Parameters.qml:", c.errorString())
+            } else {
+                console.log("⏳ Parameters.qml loading...")
+            }
+            
+        } else if (mainWindowRef && mainWindowRef.parametersWindowInstance) {
+            console.log("📋 Parameters window already exists - showing it")
+            mainWindowRef.parametersWindowInstance.visible = true
+            mainWindowRef.parametersWindowInstance.raise()
+        } else {
+            console.log("❌ mainWindowRef not set")
+        }
+    }
+}
+    }
     }
 
     Button {
@@ -341,6 +449,36 @@ Row {
             }
         }
     }
+Button {
+    id: levelButton
+    property bool isClicked: false
+    text: languageManager ? languageManager.getText("LEVEL") : "LEVEL"
+    width: 60
+    height: 30
+    flat: true
+    background: Rectangle {
+        color: levelButton.isClicked ? "green" : "#32CD32" // Light green color when not clicked
+        radius: 4
+        border.width: 0
+    }
+    contentItem: Text {
+        text: parent.text
+        color: levelButton.isClicked ? "white" : "white" // Keep text color white
+        font.family: "Consolas"
+        font.pixelSize: 16
+        font.bold: true
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+    }
+    hoverEnabled: false
+    focusPolicy: Qt.NoFocus
+    onClicked: {
+        levelButton.isClicked = !levelButton.isClicked // Toggle state on click
+        droneModel.triggerLevelCalibration()
+        console.log("Drone Leveled")
+    }
+}
+
 
     // Enhanced Altitude & Speed Dialog
     Dialog {
