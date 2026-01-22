@@ -75,7 +75,7 @@ class CalibrationModel(QObject):
             mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
             1,
             float(self.current_position),  # param1 = position enum
-           0 0, 0, 0, 0, 0, 0
+            0, 0, 0, 0, 0, 0
         )
         self.progressUpdated.emit(self.step_count + 1)  # 6 steps total
         self.step_count += 1
